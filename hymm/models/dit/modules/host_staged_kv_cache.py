@@ -7,8 +7,24 @@ write). :class:`HostStagedKVCache` keeps every layer's full K/V in pinned host
 memory and owns a ring of GPU staging slots the size of ONE layer's working
 range. Indexing layer ``i`` binds that layer's dict to a prefetched staging
 slot and starts the copy of layer ``i + slots - 1`` on a side stream, so the
-GPU holds ``slots`` layers of history instead of 54, and the lifelong cache is
-bounded by host RAM rather than VRAM. Values are never quantized or dropped.
+GPU holds ``slots`` layers of history instead of 54. Values are never
+quantized or dropped.
+
+GPU memory still grows with the history length, only 54 / (slots + B) times
+more slowly than a resident cache: each staging slot holds one layer's whole
+history, and the DiT materializes the broadcast history once more per
+guidance branch (``history_k.expand(B, ...)`` + ``torch.cat`` with the
+current chunk). Per token of history (``T`` tokens, BF16)::
+
+    GPU  ~= base + (slots + B) * 2 * heads * head_dim * 2 bytes * T
+    host ~=   54 *              2 * heads * head_dim * 2 bytes * T
+
+At 720p (16 heads x 128, 880 tokens per latent frame) that is ~22 MB of GPU
+per latent frame of history at slots=2, B=1 (~130 MB per second of video) and
+~389 MB of host RAM per latent frame. Host RAM usually runs out first; on a
+16 GB GPU with a very large host the GPU bound is roughly 60-75 s of 720p
+history. ``hymm.utils.streaming_config.host_staged_kv_preflight`` checks a
+request against free GPU memory before the cache is built.
 
 Pipeline protocol (see ``CPTCausalInferencePipeline``)::
 
@@ -16,9 +32,10 @@ Pipeline protocol (see ``CPTCausalInferencePipeline``)::
     transformer.forward_with_cache(..., kv_cache_list=cache, ...)
     cache.end_forward()
 
-``begin_forward`` sizes the staging slots to ``valid_len + extra_tokens``
-(``extra_tokens`` is the current chunk's img+txt token count on cache-write
-forwards, 0 otherwise), prefetches the first layers, and keeps already
+``begin_forward`` makes the staging slots hold at least ``valid_len +
+extra_tokens`` (``extra_tokens`` is the current chunk's img+txt token count on
+cache-write forwards, 0 otherwise; capacity grows geometrically in 256-token
+steps, capped at the host capacity), prefetches the first layers, and keeps already
 prefetched layers when consecutive forwards share the same geometry (the
 eight denoise steps of a segment). On update forwards, each layer's newly
 written range is copied back to the host before its slot is reused.
@@ -38,6 +55,8 @@ from typing import Dict, List, Optional
 import torch
 
 from hymm.utils.module_streaming import RingScheduler, allocate_pinned_exact
+
+_STAGING_GRANULE = 256  # staging capacity grows in multiples of this many tokens
 
 
 class HostStagedKVCache(list):
@@ -96,6 +115,7 @@ class HostStagedKVCache(list):
         self.bytes_d2h = 0
         self.resyncs = 0
         self.forwards = 0
+        self.staging_allocations = 0
         self.peak_staging_bytes = 0
 
     # ------------------------------------------------------------------
@@ -135,20 +155,34 @@ class HostStagedKVCache(list):
         for layer in range(self.num_blocks):
             self._unbind(layer)
 
+    def _staging_target(self, needed: int) -> int:
+        """Capacity to allocate when ``needed`` tokens no longer fit.
+
+        Every update forward needs ``valid + extra`` tokens, more than the last
+        one, so an exact-size ring would be reallocated (drain + empty_cache +
+        malloc) on every cache write. Grow by >= 25% in 256-token steps,
+        capped at the host capacity; slices still use ``valid_len`` / ``extra``.
+        """
+        target = max(int(needed), int(1.25 * self._staging_capacity))
+        target = (target + _STAGING_GRANULE - 1) // _STAGING_GRANULE * _STAGING_GRANULE
+        return max(int(needed), min(target, self.capacity))
+
     def _ensure_staging(self, needed: int) -> None:
         if needed <= self._staging_capacity and self._staging:
             return
+        capacity = self._staging_target(needed)
         self._drain()
         self._unbind_entries()
         self._staging = []
         torch.cuda.empty_cache()
         with torch.inference_mode(False), torch.no_grad():
-            shape = [self.batch_size, needed, self.cache_heads, self.head_dim]
+            shape = [self.batch_size, capacity, self.cache_heads, self.head_dim]
             self._staging = [
                 {"k": self._device_empty(shape), "v": self._device_empty(shape)}
                 for _ in range(self.slots)
             ]
-        self._staging_capacity = needed
+        self._staging_capacity = capacity
+        self.staging_allocations += 1
         self._slot_layer = [None] * self.slots
         self._ring_valid_for = None
         self.peak_staging_bytes = max(self.peak_staging_bytes, self.staging_bytes())
@@ -228,9 +262,15 @@ class HostStagedKVCache(list):
                 self._copy_stream.wait_event(free_event)
             if valid_len > 0:
                 for key in ("k", "v"):
-                    self._staging[slot][key][:, :valid_len].copy_(
-                        self._host[layer][key][:, :valid_len], non_blocking=self._pin_memory
-                    )
+                    # Per batch row: ``[b, :valid_len]`` of a [B, cap, H, D]
+                    # tensor is contiguous, ``[:, :valid_len]`` is not for B > 1
+                    # (a strided copy would stage through a blocking pageable
+                    # temporary).
+                    staging, host = self._staging[slot][key], self._host[layer][key]
+                    for row in range(self.batch_size):
+                        staging[row, :valid_len].copy_(
+                            host[row, :valid_len], non_blocking=self._pin_memory
+                        )
             ready = torch.cuda.Event()
             ready.record(self._copy_stream)
         self._ready[layer] = ready
@@ -244,9 +284,9 @@ class HostStagedKVCache(list):
         if end <= start:
             return
         for key in ("k", "v"):
-            self._host[layer][key][:, start:end].copy_(
-                self._staging[slot][key][:, start:end], non_blocking=self._pin_memory
-            )
+            host, staging = self._host[layer][key], self._staging[slot][key]
+            for row in range(self.batch_size):  # contiguous rows, see _issue_load
+                host[row, start:end].copy_(staging[row, start:end], non_blocking=self._pin_memory)
         self.bytes_d2h += 2 * (end - start) * self.batch_size * self.cache_heads * self.head_dim * 2
 
     def _resync(self, layer: int, compute) -> None:
@@ -379,6 +419,7 @@ class HostStagedKVCache(list):
             "staging_bytes": self.staging_bytes(),
             "peak_staging_bytes": self.peak_staging_bytes,
             "staging_capacity_tokens": self._staging_capacity,
+            "staging_allocations": self.staging_allocations,
             "slots": self.slots,
             "layer_loads": self.layer_loads,
             "bytes_h2d": self.bytes_h2d,

@@ -90,6 +90,147 @@ def test_load_reference_frames_resizes_to_cover_and_center_crops(tmp_path):
         load_reference_frames(str(path), height=64, width=64, frames=0)
 
 
+@pytest.mark.parametrize("suffix", [".jpg", ".png"])
+@pytest.mark.parametrize("orientation,left,right", [(6, "blue", "red"), (8, "red", "blue")])
+def test_load_reference_frames_applies_exif_orientation(tmp_path, suffix, orientation, left, right):
+    """B-M2: a camera photo stored landscape with Orientation=6/8 is displayed portrait."""
+    from PIL import Image
+
+    # Stored 40 wide x 20 tall: top half red, bottom half blue. Orientation 6
+    # displays it rotated 90 degrees clockwise (20 x 40, red on the right),
+    # orientation 8 counter-clockwise (red on the left).
+    image = Image.new("RGB", (40, 20), (0, 0, 255))
+    image.paste((255, 0, 0), (0, 0, 40, 10))
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    path = tmp_path / f"rotated{suffix}"
+    image.save(path, exif=exif.tobytes(), **({"quality": 95} if suffix == ".jpg" else {}))
+
+    frames = load_reference_frames(str(path), height=40, width=20, frames=1)
+    assert frames.shape == (1, 3, 1, 40, 20)
+    colour = {"red": (0, 2), "blue": (2, 0)}  # (high channel, low channel)
+    for column, name in ((2, left), (17, right)):
+        pixel = frames[0, :, 0, 20, column]
+        high, low = colour[name]
+        assert pixel[high] > 0.8 and pixel[low] < -0.8, (name, column, pixel)
+
+
+def test_reference_encode_estimate_matches_measured_peaks():
+    """B-M1: ~1.7 GiB weights + ~0.75 GiB per 720p pixel frame, capped at the 40-frame chunk."""
+    from hymm.utils.reference_image import (
+        DCAEV_ENCODER_BF16_BYTES,
+        choose_reference_full_clip,
+        reference_encode_peak_bytes,
+    )
+
+    gib = 2**30
+    assert DCAEV_ENCODER_BF16_BYTES / gib == pytest.approx(1.71, abs=0.01)
+    single = reference_encode_peak_bytes(pixel_frames=4, height=704, width=1280)
+    full = reference_encode_peak_bytes(pixel_frames=16, height=704, width=1280)
+    assert single / gib == pytest.approx(1.71 + 3.0, abs=0.05)
+    assert full / gib == pytest.approx(13.7, abs=0.1)  # >= 13.8 GiB measured incl. rounding
+    assert reference_encode_peak_bytes(pixel_frames=400, height=704, width=1280) == (
+        reference_encode_peak_bytes(pixel_frames=40, height=704, width=1280)
+    )
+    half = reference_encode_peak_bytes(pixel_frames=16, height=352, width=1280, weight_bytes=0)
+    assert half == pytest.approx((full - DCAEV_ENCODER_BF16_BYTES) / 2, rel=1e-6)
+
+    kwargs = dict(latent_frames=4, t_ratio=4, height=704, width=1280)
+    assert choose_reference_full_clip(True, free_bytes=12 * gib, **kwargs) == (False, full)
+    assert choose_reference_full_clip(True, free_bytes=20 * gib, **kwargs) == (True, full)
+    assert choose_reference_full_clip(True, free_bytes=None, **kwargs)[0] is True
+    assert choose_reference_full_clip(False, free_bytes=80 * gib, **kwargs)[0] is False
+
+
+# ---------------------------------------------------------------------------
+# Per-entry reference options (B-L5 ii)
+# ---------------------------------------------------------------------------
+def _ref_defaults(**values):
+    base = dict(reference_image=None, reference_prompt=None, reference_latent_frames=4)
+    base.update(values)
+    return SimpleNamespace(**base)
+
+
+def test_resolve_reference_image_path_is_relative_to_the_prompt_file(tmp_path):
+    from hymm.utils.reference_image import resolve_reference_image_path
+
+    (tmp_path / "refs").mkdir()
+    image = tmp_path / "refs" / "a.png"
+    image.write_bytes(b"x")
+    assert resolve_reference_image_path("refs/a.png", tmp_path) == str(image.resolve())
+    assert resolve_reference_image_path(str(image), None) == str(image)
+    assert resolve_reference_image_path(None, tmp_path) is None
+    assert resolve_reference_image_path("", tmp_path) is None
+    with pytest.raises(FileNotFoundError, match=r"\[case7\] reference_image does not exist"):
+        resolve_reference_image_path("refs/missing.png", tmp_path, label="case7")
+    with pytest.raises(FileNotFoundError, match=r"^\[0\] "):
+        resolve_reference_image_path("missing.png", tmp_path, label=0)
+
+
+def test_resolve_reference_entry_merges_entry_and_defaults(tmp_path):
+    from hymm.utils.reference_image import ReferenceSpec, resolve_reference_entry
+
+    image = tmp_path / "ref.png"
+    image.write_bytes(b"x")
+    assert resolve_reference_entry(None, None, _ref_defaults()) == ReferenceSpec(None, None, 4)
+    # Without an image the frame count is not parsed at all.
+    assert resolve_reference_entry({"reference_latent_frames": "x"}, None, _ref_defaults()).latent_frames == 4
+    spec = resolve_reference_entry(
+        {"reference_image": "ref.png", "reference_prompt": {"Style": "Anime"},
+         "reference_latent_frames": " 6 "},
+        tmp_path, _ref_defaults(reference_prompt="ignored"),
+    )
+    assert spec.image == str(image.resolve())
+    assert json.loads(spec.prompt) == {"Style": "Anime"}
+    assert spec.latent_frames == 6
+    spec = resolve_reference_entry({}, None, _ref_defaults(reference_image=str(image),
+                                                         reference_prompt="cap",
+                                                         reference_latent_frames=2.0))
+    assert spec == ReferenceSpec(str(image), "cap", 2)
+    assert resolve_reference_entry({"reference_image": str(image), "reference_latent_frames": None},
+                                   None, _ref_defaults(reference_latent_frames=None)).latent_frames == 4
+    for bad in (0, -2, 2.5, "two"):
+        with pytest.raises(ValueError, match="positive integer"):
+            resolve_reference_entry({"reference_image": str(image), "reference_latent_frames": bad},
+                                    None, _ref_defaults())
+    with pytest.raises(ValueError, match="seg_ar or chunk_ar"):
+        resolve_reference_entry({"reference_image": str(image)}, None, _ref_defaults(),
+                                rollout_type="one_shot")
+    assert resolve_reference_entry({}, None, _ref_defaults(), rollout_type="one_shot").image is None
+    with pytest.raises(FileNotFoundError):
+        resolve_reference_entry({"reference_image": "nope.png"}, tmp_path, _ref_defaults())
+
+
+def _inference_tree():
+    return ast.parse((ROOT / "hymm/inference.py").read_text(encoding="utf-8"))
+
+
+def test_inference_main_uses_the_reference_helpers():
+    tree = _inference_tree()
+    called = {node.func.id for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert {"resolve_reference_entry", "resolve_reference_image_path"} <= called
+    source = ast.unparse(tree)
+    assert "parsed_frames" not in source  # the inline parser moved to the helper
+
+
+def test_kv_audit_is_written_for_host_staged_runs():
+    """B-L2: the .kv.rank*.json write condition includes the host_staged_kv section."""
+    tree = _inference_tree()
+    condition = next(node.test for node in ast.walk(tree) if isinstance(node, ast.If)
+                     and ast.unparse(node.test).startswith("kv_audit and"))
+    expression = compile(ast.Expression(condition), "inference.py", "eval")
+
+    def writes(**audit):
+        row = dict(int8_kv=False, qvg_kv=False, swa=False, host_staged_kv=None)
+        row.update(audit)
+        return bool(eval(expression, {}, {"kv_audit": row}))  # noqa: S307 - the repo's own condition
+
+    assert writes(host_staged_kv={"storage": "cpu-host_staged"})
+    assert writes(int8_kv=True) and writes(swa=True) and writes(qvg_kv=True)
+    assert not writes()
+
+
 def test_reference_keys_are_captured_as_meta_not_prompt_text():
     try:
         from hymm.inference import _BENCH_META_TOP_LEVEL_KEYS
@@ -180,6 +321,9 @@ class FakeStagedCache(list):
 
     def end_forward(self):
         self.events.append(("end",))
+
+    def release_staging(self):
+        self.events.append(("release",))
 
 
 def _causal_ar_source():
@@ -474,3 +618,294 @@ def test_entry_checks_reject_unsupported_requests_before_any_work(causal_ar_ns, 
         run(_entry_pipeline(sliding_window={"enabled": True}), reference_image=str(image))
     with pytest.raises(ValueError, match="positive"):
         run(_entry_pipeline(), reference_image=str(image), reference_latent_frames=0)
+
+
+# ---------------------------------------------------------------------------
+# Review iteration 2: pipeline ordering, staging release, logs, pre-flight, SP
+# ---------------------------------------------------------------------------
+def _capture_logs(level="INFO"):
+    from loguru import logger
+
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)), level=level)
+    return messages, lambda: logger.remove(sink)
+
+
+@pytest.mark.parametrize("sigma,expected", [(0.0, "cache_noise_sigma=0.000000 (timestep 0.0)"),
+                                            (0.25, "cache_noise_sigma=0.250000 (timestep 250.0)")])
+def test_cache_at_step_log_states_the_sigma_actually_used(causal_ar_ns, sigma, expected):
+    """B-L1: the log must not claim a clean write while the reference is re-noised."""
+    pipeline = _seed_pipeline(causal_ar_ns, sigma=sigma)
+    pipeline.cache_at_step = 3
+    latent, enc = _reference_inputs()
+    messages, stop = _capture_logs()
+    try:
+        _seed(pipeline, latent, enc)
+    finally:
+        stop()
+    (line,) = [m for m in messages if "cache_at_step is set" in m]
+    assert expected in line and "written clean" not in line
+    (call,) = pipeline.transformer.calls
+    assert float(call["timestep"][0]) == pytest.approx(sigma * 1000.0)
+
+
+def test_host_staging_scope_releases_staging_on_success_and_error(causal_ar_ns):
+    """A-L5: release_staging runs in a finally around the DiT residency."""
+    pipeline = _seed_pipeline(causal_ar_ns, cache=FakeStagedCache())
+    with pipeline._host_staging_scope():
+        pipeline.kv_cache.events.append(("body",))
+    assert pipeline.kv_cache.events == [("body",), ("release",)]
+    pipeline.kv_cache.events.clear()
+    with pytest.raises(RuntimeError, match="denoise OOM"):
+        with pipeline._host_staging_scope():
+            raise RuntimeError("denoise OOM")
+    assert pipeline.kv_cache.events == [("release",)]
+    plain = _seed_pipeline(causal_ar_ns)
+    with plain._host_staging_scope():
+        pass  # ordinary list caches have no staging
+
+    tree = ast.parse(_causal_ar_source())
+    pipeline_cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                        and node.name == "CPTCausalInferencePipeline")
+    scope = next(node for node in pipeline_cls.body if isinstance(node, ast.FunctionDef)
+                 and node.name == "_host_staging_scope")
+    (guard,) = [node for node in ast.walk(scope) if isinstance(node, ast.Try)]
+    assert any("release_staging" in ast.unparse(statement) for statement in guard.finalbody)
+
+
+def _top_index(body, predicate):
+    return next(i for i, node in enumerate(body) if predicate(node))
+
+
+def _calls(node, name):
+    return any(isinstance(child, ast.Call) and isinstance(child.func, (ast.Attribute, ast.Name))
+               and getattr(child.func, "attr", getattr(child.func, "id", None)) == name
+               for child in ast.walk(node))
+
+
+def test_process_single_prompt_orders_reference_preflight_and_staging():
+    """B-L5 (i): statement order inside _process_single_prompt."""
+    body = _process_node().body
+    reference_added = _top_index(body, lambda node: isinstance(node, ast.AugAssign)
+                                 and ast.unparse(node) == "max_cache_tokens += reference_tokens")
+    request_taken = _top_index(body, lambda node: isinstance(node, ast.Assign)
+                               and ast.unparse(node.targets[0]) == "request_cache_tokens")
+    first_use = _top_index(body, lambda node: not isinstance(node, ast.FunctionDef)
+                           and node is not body[request_taken]
+                           and "request_cache_tokens" in ast.unparse(node))
+    assert reference_added < request_taken < first_use
+
+    preflight = _top_index(body, lambda node: _calls(node, "_host_staged_kv_preflight"))
+    prepare = _top_index(body, lambda node: isinstance(node, ast.Expr)
+                         and _calls(node, "_prepare_persistent_kv_cache"))
+    assert preflight < prepare
+    preflight_call = next(child for child in ast.walk(body[preflight]) if isinstance(child, ast.Call)
+                          and getattr(child.func, "attr", None) == "_host_staged_kv_preflight")
+    keywords = {kw.arg: ast.unparse(kw.value) for kw in preflight_call.keywords}
+    assert keywords["history_tokens"] == "request_cache_tokens"
+    assert keywords["capacity_tokens"] == "max_cache_tokens"
+    assert keywords["guidance_batch"] == "cfg_batch"
+
+    residency = next(node for node in body if isinstance(node, ast.With)
+                     and any(_calls(item.context_expr, "_dit_denoise_residency") for item in node.items))
+    assert [ast.unparse(item.context_expr) for item in residency.items] == [
+        "self._host_staging_scope()", "self._dit_denoise_residency()",
+    ]
+    inner = residency.body
+    seeded = _top_index(inner, lambda node: _calls(node, "_seed_reference_history"))
+    segment_start = _top_index(inner, lambda node: isinstance(node, ast.Assign)
+                               and ast.unparse(node.targets[0]) == "segment_cache_start")
+    assert seeded < segment_start
+    # No bare release after the residency any more: the scope owns it.
+    assert not any(isinstance(node, ast.If) and "release_staging" in ast.unparse(node)
+                   for node in body[body.index(residency) + 1:])
+
+
+class _StreamerStub:
+    active = False
+
+    def phase_device_bytes(self):
+        return 2 * 311 * 10**6 + 10**9
+
+
+def _preflight_pipeline(causal_ar_ns, **inference):
+    cls = causal_ar_ns["CPTCausalInferencePipeline"]
+    pipeline = cls.__new__(cls)
+    nn.Module.__init__(pipeline)
+    values = dict(kv_cache_host_staging=True, kv_cache_host_staging_slots=2,
+                  kv_cache_host_staging_preflight=True, video_fps=24)
+    values.update(inference)
+    pipeline.args = SimpleNamespace(inference=SimpleNamespace(**values))
+    pipeline.hidden_size, pipeline.heads_num, pipeline.num_double_blocks = 2048, 16, 54
+    pipeline.target_dtype = torch.bfloat16
+    pipeline.device = torch.device("cuda")
+    pipeline.t_ratio = 4
+    pipeline.transformer = SimpleNamespace(_module_streamer=_StreamerStub())
+    return pipeline
+
+
+@pytest.fixture
+def preflight_ns(causal_ar_ns):
+    namespace = dict(causal_ar_ns)
+    namespace["get_sequence_parallel_state"] = lambda: False
+    tree = ast.parse(_causal_ar_source())
+    pipeline_cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                        and node.name == "CPTCausalInferencePipeline")
+    pipeline_cls.body = [node for node in pipeline_cls.body if isinstance(node, ast.FunctionDef)
+                         and node.name in ("_host_staged_kv_preflight", "_dit_phase_resident_bytes")]
+    pipeline_cls.bases = [ast.Name(id="BasePipeline", ctx=ast.Load())]
+    pipeline_cls.decorator_list = []
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[pipeline_cls], type_ignores=[])),
+                 "causal_ar.py", "exec"), namespace)
+    return namespace
+
+
+def _run_preflight(pipeline, frames):
+    tokens_per_frame, text_len, chunk = 880, 256, 20
+    return pipeline._host_staged_kv_preflight(
+        history_tokens=frames * tokens_per_frame + (frames // chunk) * text_len,
+        capacity_tokens=(frames + chunk) * tokens_per_frame + (frames // chunk + 1) * text_len,
+        activation_tokens=chunk * tokens_per_frame + text_len,
+        history_latent_frames=frames,
+        cache_batch=1,
+        guidance_batch=1,
+    )
+
+
+def test_pipeline_preflight_uses_free_memory_and_can_be_disabled(preflight_ns, monkeypatch):
+    """B-H1: the pipeline compares the estimate with mem_get_info and logs it once."""
+    gib = 2**30
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (12 * gib, 16 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: gib)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: gib // 2)
+    pipeline = _preflight_pipeline(preflight_ns)
+    messages, stop = _capture_logs()
+    try:
+        short = _run_preflight(pipeline, 120)
+        with pytest.raises(ValueError, match="pre-flight") as error:
+            _run_preflight(pipeline, 2400)
+    finally:
+        stop()
+    assert short["fits"] and short["free_bytes"] == 12 * gib + gib // 2
+    assert short["resident_bytes"] == _StreamerStub().phase_device_bytes() + 54 * (
+        140 * 880 + 7 * 256
+    )
+    assert "12.50 GiB is free" in str(error.value)
+    estimates = [m for m in messages if "Host-staged KV estimate" in m]
+    assert len(estimates) == 2 and "host KV" in estimates[0] and "(slots=2 + B=1)" in estimates[0]
+
+    disabled = _preflight_pipeline(preflight_ns, kv_cache_host_staging_preflight=False)
+    report = _run_preflight(disabled, 2400)
+    assert report["fits"] is False  # still estimated and logged, not enforced
+
+
+def test_pipeline_preflight_without_cuda_only_logs(preflight_ns, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    report = _run_preflight(_preflight_pipeline(preflight_ns), 100_000)
+    assert report["fits"] is None and report["host_kv_bytes"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Reference encode on SP rank 0 + broadcast (B-L4)
+# ---------------------------------------------------------------------------
+def _base_methods(*names):
+    from loguru import logger
+
+    tree = ast.parse((ROOT / "hymm/pipeline/base.py").read_text(encoding="utf-8"))
+    base = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "BasePipeline")
+    methods = [node for node in base.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace = {"torch": torch, "logger": logger}
+    exec(compile(ast.Module(body=methods, type_ignores=[]), "base.py", "exec"), namespace)
+    return [namespace[name] for name in names]
+
+
+class _FakeDist:
+    def __init__(self, source_header=None, source_latent=None):
+        self.calls = []
+        self.source_header = source_header
+        self.source_latent = source_latent
+
+    def broadcast(self, tensor, src, group):
+        self.calls.append((tuple(tensor.shape), src, group))
+        if len(self.calls) == 1 and self.source_header is not None:
+            tensor.copy_(self.source_header)
+        elif len(self.calls) == 2 and self.source_latent is not None:
+            tensor.copy_(self.source_latent)
+
+
+def _sp_fake(monkeypatch, *, sp_size, rank, dist_stub):
+    import torch.distributed as dist
+
+    from hymm.distributed.parallel_states import nccl_info
+
+    group = object()
+    monkeypatch.setattr(nccl_info, "sp_size", sp_size)
+    monkeypatch.setattr(nccl_info, "sp_group", group if sp_size > 1 else None)
+    monkeypatch.setattr(nccl_info, "rank_within_spgroup", rank)
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_global_rank", lambda g, r: 4 + r, raising=False)
+    monkeypatch.setattr(dist, "broadcast", dist_stub.broadcast)
+    sp_group, encode = _base_methods("_reference_sp_group", "_encode_reference_image_latent")
+    local_calls = []
+    latent = torch.arange(32 * 2 * 2 * 3, dtype=torch.float32).reshape(1, 32, 2, 2, 3)
+
+    def local(image_path, **kwargs):
+        local_calls.append((image_path, kwargs))
+        if isinstance(fake.fail, Exception):
+            raise fake.fail
+        return latent.clone()
+
+    fake = SimpleNamespace(device=torch.device("cpu"), target_dtype=torch.float32, fail=None)
+    fake._reference_sp_group = MethodType(sp_group, fake)
+    fake._encode_reference_image_latent = MethodType(encode, fake)
+    fake._encode_reference_image_latent_local = local
+    return fake, local_calls, latent, group
+
+
+def _encode(fake):
+    return fake._encode_reference_image_latent(
+        "ref.png", latent_h=2, latent_w=3, latent_frames=2, encode_full_clip=True,
+    )
+
+
+def test_reference_encode_without_sp_is_local(monkeypatch):
+    stub = _FakeDist()
+    fake, local_calls, latent, _ = _sp_fake(monkeypatch, sp_size=1, rank=0, dist_stub=stub)
+    assert torch.equal(_encode(fake), latent)
+    assert len(local_calls) == 1 and local_calls[0][1]["encode_full_clip"] is True
+    assert stub.calls == []
+
+
+def test_reference_encode_on_sp_rank0_broadcasts(monkeypatch):
+    stub = _FakeDist()
+    fake, local_calls, latent, group = _sp_fake(monkeypatch, sp_size=2, rank=0, dist_stub=stub)
+    assert torch.equal(_encode(fake), latent)
+    assert len(local_calls) == 1
+    assert stub.calls == [((6,), 4, group), (tuple(latent.shape), 4, group)]
+
+
+def test_reference_encode_on_sp_peer_receives_without_encoding(monkeypatch):
+    source = torch.full((1, 32, 2, 2, 3), 7.0)
+    header = torch.tensor([1, *source.shape], dtype=torch.int64)
+    stub = _FakeDist(source_header=header, source_latent=source)
+    fake, local_calls, _, group = _sp_fake(monkeypatch, sp_size=4, rank=2, dist_stub=stub)
+    received = _encode(fake)
+    assert local_calls == []
+    assert received.dtype == torch.float32 and torch.equal(received, source)
+    assert [call[1] for call in stub.calls] == [4, 4]
+
+
+def test_reference_encode_failure_on_rank0_raises_on_every_rank(monkeypatch):
+    stub = _FakeDist()
+    fake, _, _, _ = _sp_fake(monkeypatch, sp_size=2, rank=0, dist_stub=stub)
+    fake.fail = FileNotFoundError("ref.png")
+    with pytest.raises(FileNotFoundError):
+        _encode(fake)
+    assert len(stub.calls) == 1  # the header still went out so peers do not hang
+    peer_stub = _FakeDist(source_header=torch.zeros(6, dtype=torch.int64))
+    peer, _, _, _ = _sp_fake(monkeypatch, sp_size=2, rank=1, dist_stub=peer_stub)
+    with pytest.raises(RuntimeError, match="failed on SP rank 0"):
+        _encode(peer)
+    assert len(peer_stub.calls) == 1

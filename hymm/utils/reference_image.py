@@ -1,11 +1,141 @@
-"""Pure helpers for reference-image KV seeding (prompt shaping and pixel loading)."""
+"""Pure helpers for reference-image KV seeding.
+
+Prompt shaping, pixel loading, per-entry option resolution and the DCAE-V
+encode memory estimate; none of them needs CUDA.
+"""
 
 from __future__ import annotations
 
 import json
-from typing import Optional
+from pathlib import Path
+from typing import Any, Mapping, NamedTuple, Optional, Tuple
 
 import torch
+
+# ---------------------------------------------------------------------------
+# DCAE-V reference encode memory (measured on a meta/dispatch trace)
+# ---------------------------------------------------------------------------
+DCAEV_ENCODER_PARAMS = 916_700_000
+DCAEV_ENCODER_BF16_BYTES = 2 * DCAEV_ENCODER_PARAMS  # ~1.71 GiB
+# Activation peak per pixel frame at the measured 704x1280 plane: ~3.0 GiB for
+# 4 frames, ~12.1 GiB for 16 frames. Scaled by pixel area for other sizes.
+DCAEV_ENCODE_BYTES_PER_PIXEL_FRAME = int(0.75 * 2**30)
+DCAEV_ENCODE_REFERENCE_AREA = 704 * 1280
+# The causal encoder processes at most one 40-frame chunk at a time.
+DCAEV_ENCODE_CHUNK_PIXEL_FRAMES = 40
+
+
+def reference_encode_peak_bytes(
+    *, pixel_frames: int, height: int, width: int, weight_bytes: int = DCAEV_ENCODER_BF16_BYTES,
+) -> int:
+    """Estimated GPU peak of one DCAE-V encode (weights + activations, no cuDNN workspace)."""
+    frames = min(max(1, int(pixel_frames)), DCAEV_ENCODE_CHUNK_PIXEL_FRAMES)
+    scale = (int(height) * int(width)) / DCAEV_ENCODE_REFERENCE_AREA
+    return int(weight_bytes) + int(DCAEV_ENCODE_BYTES_PER_PIXEL_FRAME * frames * scale)
+
+
+def choose_reference_full_clip(
+    requested: bool,
+    *,
+    latent_frames: int,
+    t_ratio: int,
+    height: int,
+    width: int,
+    free_bytes: Optional[int],
+    weight_bytes: int = DCAEV_ENCODER_BF16_BYTES,
+) -> Tuple[bool, int]:
+    """Keep ``reference_encode_full_clip`` only when its estimated peak fits ``free_bytes``.
+
+    Returns ``(use_full_clip, estimated_full_clip_bytes)``. ``free_bytes=None``
+    (no CUDA) keeps the request as is.
+    """
+    estimate = reference_encode_peak_bytes(
+        pixel_frames=int(t_ratio) * int(latent_frames), height=height, width=width,
+        weight_bytes=weight_bytes,
+    )
+    if not requested:
+        return False, estimate
+    if free_bytes is None:
+        return True, estimate
+    return estimate <= int(free_bytes), estimate
+
+
+# ---------------------------------------------------------------------------
+# Per-entry reference options
+# ---------------------------------------------------------------------------
+class ReferenceSpec(NamedTuple):
+    image: Optional[str]
+    prompt: Optional[str]
+    latent_frames: int
+
+
+def resolve_reference_image_path(
+    value: Any, json_dir: Optional[Path], *, label: Any = "",
+) -> Optional[str]:
+    """Resolve a prompt-file ``reference_image`` (relative to the JSON's directory).
+
+    Returns ``None`` for an empty value and raises ``FileNotFoundError`` when
+    the resolved file does not exist.
+    """
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute() and json_dir is not None:
+        path = (Path(json_dir) / path).resolve()
+    if not path.is_file():
+        prefix = "" if label is None or label == "" else f"[{label}] "
+        raise FileNotFoundError(f"{prefix}reference_image does not exist: {path}")
+    return str(path)
+
+
+def resolve_reference_entry(
+    entry: Optional[Mapping[str, Any]],
+    json_dir: Optional[Path],
+    cfg_defaults: Any,
+    *,
+    rollout_type: str = "seg_ar",
+    label: Any = "",
+) -> ReferenceSpec:
+    """Effective reference image / prompt / latent frames for one prompt entry.
+
+    Entry keys override ``cfg_defaults`` (``inference.reference_*``). A relative
+    entry image is resolved against ``json_dir`` (pass ``None`` when the loader
+    already resolved it). A dict / list prompt is serialized to JSON.
+    ``reference_latent_frames`` is parsed only when an image is set (``None``
+    means the default 4; numeric strings are accepted; it must be a positive
+    integer). Seeding is rejected for ``rollout_type == "one_shot"``.
+    """
+    entry = entry or {}
+    entry_image = entry.get("reference_image")
+    if entry_image and json_dir is not None:
+        entry_image = resolve_reference_image_path(entry_image, json_dir, label=label)
+    image = entry_image or getattr(cfg_defaults, "reference_image", None)
+    prompt = entry.get("reference_prompt") or getattr(cfg_defaults, "reference_prompt", None)
+    if isinstance(prompt, (dict, list)):
+        # A structured JSON prompt given inline in the prompt file.
+        prompt = json.dumps(prompt, ensure_ascii=False)
+    frames = 4
+    if image:
+        raw_frames = entry.get("reference_latent_frames")
+        if raw_frames is None:
+            raw_frames = getattr(cfg_defaults, "reference_latent_frames", None)
+        if raw_frames is not None:
+            try:
+                parsed = float(str(raw_frames).strip())
+            except ValueError:
+                parsed = float("nan")
+            if not parsed.is_integer():
+                raise ValueError(
+                    f"reference_latent_frames must be a positive integer, got {raw_frames!r}"
+                )
+            frames = int(parsed)
+        if frames <= 0:
+            raise ValueError(
+                f"reference_latent_frames must be a positive integer, got {raw_frames!r}"
+            )
+        if rollout_type == "one_shot":
+            raise ValueError("reference_image seeding requires rollout_type seg_ar or chunk_ar")
+    return ReferenceSpec(image=image, prompt=prompt, latent_frames=frames)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -57,16 +187,20 @@ def default_reference_prompt(
 def load_reference_frames(
     image_path: str, *, height: int, width: int, frames: int,
 ) -> torch.Tensor:
-    """``[1, 3, frames, height, width]`` float32 in ``[-1, 1]``: resize to cover, center crop, repeat."""
+    """``[1, 3, frames, height, width]`` float32 in ``[-1, 1]``: resize to cover, center crop, repeat.
+
+    The EXIF orientation tag is applied first, so camera photos come out the
+    way they are displayed.
+    """
     import numpy as np
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     if frames <= 0:
         raise ValueError("reference frames must be positive")
     if height <= 0 or width <= 0:
         raise ValueError("reference height/width must be positive")
     with Image.open(image_path) as handle:
-        image = handle.convert("RGB")
+        image = ImageOps.exif_transpose(handle).convert("RGB")
         src_w, src_h = image.size
         scale = max(width / src_w, height / src_h)
         new_w = max(width, int(round(src_w * scale)))

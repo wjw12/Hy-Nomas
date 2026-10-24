@@ -1,16 +1,32 @@
 # @package _global_
 # Single-GPU BF16 preset for cards with about 16 GB (and 12 GB) of memory.
 #
-# No quantization, no compression, no sliding window: the full BF16 DiT,
-# PixelUMM decoder and Qwen2.5-VL text encoder run with output identical to the
-# multi-GPU preset. Memory comes from scheduling only:
+# No quantization, no compression, no sliding window: the same BF16 DiT,
+# PixelUMM decoder and Qwen2.5-VL text encoder, sampling schedule and BF16
+# precision as the official multi-GPU preset. Results are not bitwise
+# identical to it: the attention backend (flex here, magi there), the
+# sequence-parallel degree and torch.compile change floating-point rounding.
+# Memory comes from scheduling only:
 #   * each model is streamed layer by layer from pinned host memory through a
 #     ring of GPU slot buffers (unit i+1 copies while unit i computes);
 #   * the lifelong KV history lives in pinned host memory and is staged per
 #     layer into GPU double buffers;
 #   * phases stay mutually exclusive (text encode -> DiT -> decode).
-# Host RAM is the new ceiling: ~17 GB (DiT) + ~14 GB (text encoder) + ~14 GB
-# (decoder) of pinned weights, plus ~389 MB of KV per generated latent frame
+# GPU memory is NOT independent of the history length. Each staging slot holds
+# one layer's whole history and the DiT materializes the broadcast history once
+# per guidance row (B = 1 without CFG), so with T history tokens
+#   GPU  ~= base + (slots + B) x 2 x heads x head_dim x 2 bytes x T
+#   host ~=   54 x              2 x heads x head_dim x 2 bytes x T
+# At 720x1280 (16 heads x 128, 880 tokens per latent frame) that is ~22 MB of
+# GPU per latent frame of history at slots=2, B=1 (~130 MB per second of
+# video, ~29-50 MB per latent frame with CFG). A pre-flight check
+# (inference.kv_cache_host_staging_preflight) rejects requests whose history
+# would not fit and reports the longest one that does; on a 16 GB card with a
+# very large host the GPU bound is roughly 60-75 s of 720p history.
+# Host RAM is usually the ceiling first: ~17 GB (DiT) + ~14 GB (text encoder:
+# only the Qwen2.5-VL language model is kept, 28 layers + embed_tokens, no
+# vision tower and no lm_head, 7.07 B params x 2 bytes = 14.1 GB) + ~14 GB
+# (decoder) of pinned weights, plus ~389 MB of KV per latent frame of history
 # at 720x1280 (~2.3 GB per second of video). 64 GB host RAM is the practical
 # minimum for short clips; 96 to 128 GB for longer rollouts.
 defaults:

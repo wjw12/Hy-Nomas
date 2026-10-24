@@ -233,20 +233,46 @@ def test_allocate_pinned_exact_without_cuda_is_exact_pageable():
     assert flat.numel() == 311_000_001 and not pinned
 
 
+@pytest.fixture(autouse=True)
+def _fresh_host_register_state(monkeypatch):
+    """allocate_pinned_exact keeps process-wide register state; isolate every test."""
+    from hymm.utils import module_streaming
+
+    monkeypatch.setattr(module_streaming, "_HOST_REGISTER_DISABLED", False)
+    monkeypatch.setattr(module_streaming, "_HOST_REGISTER_SUCCEEDED", False)
+    monkeypatch.setattr(module_streaming, "_FALLBACK_WARNED", False)
+
+
 class _FakeCudart:
-    def __init__(self, error=0):
+    """cudart stand-in: a failing call leaves a pending error until cudaGetLastError."""
+
+    def __init__(self, error=0, unregister_error=0):
         self.error = error
+        self.unregister_error = unregister_error
         self.registered = {}
         self.unregistered = []
+        self.register_calls = 0
+        self.pending = 0
+        self.cleared = 0
 
     def cudaHostRegister(self, ptr, size, flags):
+        self.register_calls += 1
         if self.error == 0:
             self.registered[ptr] = size
+        else:
+            self.pending = self.error
         return self.error
 
     def cudaHostUnregister(self, ptr):
         self.unregistered.append(ptr)
-        return 0
+        if self.unregister_error:
+            self.pending = self.unregister_error
+        return self.unregister_error
+
+    def cudaGetLastError(self):
+        error, self.pending = self.pending, 0
+        self.cleared += 1
+        return error
 
 
 def test_allocate_pinned_exact_registers_exact_page_rounded_range(monkeypatch):
@@ -279,6 +305,138 @@ def test_allocate_pinned_exact_falls_back_when_registration_fails(monkeypatch):
     assert tensor.shape == (4, 6)
     if not pinned:  # CPU-only build: pin_memory=True fails too, pageable fallback
         assert tensor.untyped_storage().nbytes() == 4 * 6 * 4
+
+
+def _fake_cuda_available(monkeypatch, cudart):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+
+
+def test_failed_registration_consumes_the_pending_cuda_error(monkeypatch):
+    """A-M1: the error a failed cudaHostRegister leaves behind must not hit the next kernel."""
+    from hymm.utils import module_streaming
+
+    cudart = _FakeCudart(error=1)
+    _fake_cuda_available(monkeypatch, cudart)
+    tensor, _ = module_streaming.allocate_pinned_exact([16], torch.float32)
+    assert tensor.shape == (16,)
+    assert cudart.register_calls == 1
+    assert cudart.pending == 0 and cudart.cleared == 1
+
+
+def test_pending_error_falls_back_to_a_kernel_probe_without_get_last_error(monkeypatch):
+    """Bindings without cudaGetLastError: a trivial CUDA kernel inside try absorbs the error."""
+    from hymm.utils import module_streaming
+
+    class NoLastError(_FakeCudart):
+        cudaGetLastError = None
+
+    probes = []
+    real_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        if kwargs.get("device") == "cuda":
+            probes.append(args)
+            raise RuntimeError("CUDA error: invalid argument (pending)")
+        return real_empty(*args, **kwargs)
+
+    cudart = NoLastError(error=1)
+    _fake_cuda_available(monkeypatch, cudart)
+    monkeypatch.setattr(torch, "empty", empty)
+    tensor, _ = module_streaming.allocate_pinned_exact([8], torch.float32)
+    assert tensor.shape == (8,) and probes == [(1,)]
+
+
+@pytest.mark.parametrize("error", [801, 1])
+def test_unsupported_or_first_failure_disables_registration(monkeypatch, error):
+    """A-M1: 801 (not supported) or a failing first allocation skips registration afterwards."""
+    from hymm.utils import module_streaming
+
+    cudart = _FakeCudart(error=error)
+    _fake_cuda_available(monkeypatch, cudart)
+    for _ in range(5):
+        tensor, _ = module_streaming.allocate_pinned_exact([32], torch.uint8)
+        assert tensor.numel() == 32
+    assert cudart.register_calls == 1
+    assert module_streaming._HOST_REGISTER_DISABLED
+
+
+def test_failure_after_a_success_keeps_registration_enabled(monkeypatch):
+    from hymm.utils import module_streaming
+
+    cudart = _FakeCudart()
+    _fake_cuda_available(monkeypatch, cudart)
+    kept, pinned = module_streaming.allocate_pinned_exact([64], torch.uint8)
+    assert pinned
+    cudart.error = 2  # e.g. out of lockable memory for this one range
+    module_streaming.allocate_pinned_exact([64], torch.uint8)
+    assert not module_streaming._HOST_REGISTER_DISABLED
+    cudart.error = 0
+    _, pinned = module_streaming.allocate_pinned_exact([64], torch.uint8)
+    assert pinned and cudart.register_calls == 3
+    del kept
+
+
+def test_host_allocation_failure_is_not_reported_as_register_failure(monkeypatch):
+    """A-L1: only the cudaHostRegister call itself counts as a registration failure."""
+    from hymm.utils import module_streaming
+
+    real_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        if kwargs.get("dtype") == torch.uint8 and args and args[0] == 3 * module_streaming._PAGE:
+            raise RuntimeError("host out of memory (simulated)")
+        return real_empty(*args, **kwargs)
+
+    cudart = _FakeCudart()
+    _fake_cuda_available(monkeypatch, cudart)
+    monkeypatch.setattr(torch, "empty", empty)
+    tensor, _ = module_streaming.allocate_pinned_exact([2 * module_streaming._PAGE], torch.uint8)
+    assert tensor.numel() == 2 * module_streaming._PAGE
+    assert cudart.register_calls == 0 and not module_streaming._HOST_REGISTER_DISABLED
+
+
+def test_failed_registration_drops_the_buffer_before_the_fallback(monkeypatch):
+    """A-L1: the unregistered staging buffer is freed before the fallback allocates."""
+    import weakref
+
+    from hymm.utils import module_streaming
+
+    alive_at_fallback = []
+    bases = []
+    real_empty = torch.empty
+
+    def empty(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            alive_at_fallback.append([ref() is not None for ref in bases])
+            return real_empty(*args, **{k: v for k, v in kwargs.items() if k != "pin_memory"})
+        tensor = real_empty(*args, **kwargs)
+        size = args[0] if args else None
+        if kwargs.get("dtype") == torch.uint8 and isinstance(size, int) and size > module_streaming._PAGE:
+            bases.append(weakref.ref(tensor))
+        return tensor
+
+    _fake_cuda_available(monkeypatch, _FakeCudart(error=1))
+    monkeypatch.setattr(torch, "empty", empty)
+    module_streaming.allocate_pinned_exact([module_streaming._PAGE * 4], torch.uint8)
+    assert alive_at_fallback == [[False]]
+
+
+def test_failed_unregister_consumes_the_pending_cuda_error(monkeypatch):
+    import gc
+
+    from hymm.utils import module_streaming
+
+    cudart = _FakeCudart(unregister_error=1)
+    _fake_cuda_available(monkeypatch, cudart)
+    tensor, pinned = module_streaming.allocate_pinned_exact([4096], torch.uint8)
+    assert pinned
+    ptr = tensor.data_ptr()
+    del tensor
+    gc.collect()
+    assert cudart.unregistered == [ptr]
+    assert cudart.pending == 0 and cudart.cleared == 1
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +543,7 @@ def fake_cuda(monkeypatch):
     return compute
 
 
-def _cpu_staged_cache(num_blocks=5, slots=2, capacity=16):
+def _cpu_staged_cache(num_blocks=5, slots=2, capacity=16, batch_size=1):
     from hymm.models.dit.modules.host_staged_kv_cache import HostStagedKVCache
 
     class CPUStagedCache(HostStagedKVCache):
@@ -393,7 +551,7 @@ def _cpu_staged_cache(num_blocks=5, slots=2, capacity=16):
             return torch.zeros(shape, dtype=self.dtype)
 
     cache = CPUStagedCache(
-        num_blocks=num_blocks, batch_size=1, max_cache_tokens=capacity, cache_heads=2,
+        num_blocks=num_blocks, batch_size=batch_size, max_cache_tokens=capacity, cache_heads=2,
         head_dim=4, dtype=torch.bfloat16, device=torch.device("cuda"), slots=slots,
     )
     for layer in range(num_blocks):
@@ -454,7 +612,8 @@ def test_host_staged_entries_never_keep_staging_views(fake_cuda):
     assert all(list.__getitem__(cache, i)["k"].numel() == 0 for i in range(5))
     old_storage = cache._staging[0]["k"].untyped_storage().data_ptr()
     cache.begin_forward(valid_len=8, extra_tokens=4, update=True)  # regrows staging
-    assert cache._staging_capacity == 12
+    # 12 needed, rounded up to the 256-token granule, capped at the host capacity.
+    assert cache._staging_capacity == 16
     assert all(list.__getitem__(cache, i)["k"].numel() == 0 for i in range(5))
     for layer in range(5):
         cache[layer]
@@ -518,6 +677,144 @@ def test_host_staged_update_forward_writes_back_and_next_forward_reloads(fake_cu
     cache.end_forward()
 
 
+def _run_forward(cache, valid_len, extra, value=None):
+    cache.begin_forward(valid_len=valid_len, extra_tokens=extra, update=extra > 0)
+    for layer in range(cache.num_blocks):
+        entry = cache[layer]
+        assert entry["k"].shape[1] == valid_len + extra  # never the staging capacity
+        if value is not None:
+            entry["k"][:, valid_len:valid_len + extra].fill_(value + layer)
+            entry["v"][:, valid_len:valid_len + extra].fill_(-(value + layer))
+    cache.end_forward()
+
+
+def test_host_staged_staging_grows_geometrically(fake_cuda):
+    """A-L4: consecutive growing cache writes do not reallocate the ring every time."""
+    cache = _cpu_staged_cache(capacity=2048)
+    _run_forward(cache, 0, 100, value=10.0)
+    assert cache.staging_allocations == 1 and cache._staging_capacity == 256
+    _run_forward(cache, 100, 0)  # denoise on the grown history
+    _run_forward(cache, 100, 100, value=20.0)
+    assert cache.staging_allocations == 1  # 200 tokens still fit the 256-token ring
+    _run_forward(cache, 200, 100, value=30.0)
+    # 300 > 256: max(300, 1.25 * 256) rounded up to 512.
+    assert cache.staging_allocations == 2 and cache._staging_capacity == 512
+    for layer in range(cache.num_blocks):
+        host_k, host_v = cache._host[layer]["k"], cache._host[layer]["v"]
+        for start, value in ((0, 10.0), (100, 20.0), (200, 30.0)):
+            assert torch.all(host_k[:, start:start + 100] == value + layer)
+            assert torch.all(host_v[:, start:start + 100] == -(value + layer))
+        # Write-back used valid_len/extra, never the staging capacity.
+        assert torch.all(host_k[:, 300:512] == layer + 1)
+
+
+def test_host_staged_staging_is_capped_at_host_capacity(fake_cuda):
+    cache = _cpu_staged_cache(capacity=300)
+    _run_forward(cache, 0, 290)
+    assert cache._staging_capacity == 300
+
+
+def test_host_staged_batched_rows_round_trip(fake_cuda):
+    """A-L6: B=2 rows are copied per contiguous row and stay distinct."""
+    cache = _cpu_staged_cache(batch_size=2)
+    for layer in range(5):
+        for row in range(2):
+            cache._host[layer]["k"][row].fill_(10.0 * layer + row + 1)
+            cache._host[layer]["v"][row].fill_(-(10.0 * layer + row + 1))
+    cache.begin_forward(valid_len=4, extra_tokens=2, update=True)
+    for layer in range(5):
+        entry = cache[layer]
+        assert entry["k"].shape[:2] == (2, 6)
+        for row in range(2):
+            assert torch.all(entry["k"][row, :4] == 10.0 * layer + row + 1)
+            assert torch.all(entry["v"][row, :4] == -(10.0 * layer + row + 1))
+            entry["k"][row, 4:6].fill_(100.0 + 10 * layer + row)
+            entry["v"][row, 4:6].fill_(-(100.0 + 10 * layer + row))
+    cache.end_forward()
+    for layer in range(5):
+        for row in range(2):
+            host_k, host_v = cache._host[layer]["k"][row], cache._host[layer]["v"][row]
+            assert torch.all(host_k[:4] == 10.0 * layer + row + 1)
+            assert torch.all(host_k[4:6] == 100.0 + 10 * layer + row)
+            assert torch.all(host_v[4:6] == -(100.0 + 10 * layer + row))
+            assert torch.all(host_k[6:] == 10.0 * layer + row + 1)  # untouched past the write
+
+
+# ---------------------------------------------------------------------------
+# ModuleStreamer ring on CPU stand-ins (A-L2, A-L3)
+# ---------------------------------------------------------------------------
+def _cpu_streamer(model, units, **kwargs):
+    from hymm.utils.module_streaming import ModuleStreamer
+
+    streamer = ModuleStreamer(units, resident=modules_outside(model, units),
+                              device=torch.device("cuda"), **kwargs)
+    streamer.device = torch.device("cpu")  # "device" buffers are CPU tensors here
+    return streamer
+
+
+def test_all_fit_ring_allocates_only_the_slots_it_uses(fake_cuda):
+    """A-L2: one streamed unit left by resident blocks needs one slot, not ``slots``."""
+    model = _model()
+    units = [[block] for block in model.blocks]
+    streamer = _cpu_streamer(model, units, slots=2, resident_units=2)
+    expected = streamer.phase_device_bytes()
+    streamer.enter()
+    try:
+        assert len(streamer._slot_buffers) == 1
+        assert streamer.device_bytes() == expected
+        assert expected == streamer.unit_bytes + sum(p.nbytes for p in streamer.packed[:2]) + (
+            streamer.resident_packed.nbytes
+        )
+    finally:
+        streamer.exit()
+    other = _model()
+    full = _cpu_streamer(other, [[block] for block in other.blocks], slots=2)
+    assert full.phase_device_bytes() == 2 * full.unit_bytes + full.resident_packed.nbytes
+
+
+def _linear_stack(count=4):
+    model = nn.Module()
+    model.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(count)])
+    return model.eval().requires_grad_(False)
+
+
+def _inside(tensor, buffer):
+    start = buffer.data_ptr()
+    return start <= tensor.data_ptr() < start + buffer.numel() * buffer.element_size()
+
+
+def test_released_units_are_rebound_to_their_host_copy(fake_cuda):
+    """A-L3: a unit that left its slot must not alias the slot being refilled."""
+    model = _linear_stack()
+    x = torch.randn(3, 4)
+    expected = x
+    for block in model.blocks:
+        expected = block(expected)
+    units = [[block] for block in model.blocks]
+    streamer = _cpu_streamer(model, units, slots=2)
+    with torch.no_grad():
+        streamer.enter()
+        try:
+            out = x
+            for index, block in enumerate(model.blocks):
+                out = block(out)
+                assert any(_inside(block.weight, slot) for slot in streamer._slot_buffers)
+                for earlier in range(index):
+                    packed = streamer.packed[earlier]
+                    weight = model.blocks[earlier].weight
+                    assert _inside(weight, packed.host), f"unit {earlier} still bound to a slot"
+                    assert not any(_inside(weight, slot) for slot in streamer._slot_buffers)
+            assert torch.equal(out, expected)
+            # Out-of-order arrival (resync): every other unit goes back to the host.
+            model.blocks[1](x)
+            assert streamer.resyncs == 1
+            for index in (0, 2, 3):
+                assert _inside(model.blocks[index].weight, streamer.packed[index].host)
+            assert any(_inside(model.blocks[1].weight, slot) for slot in streamer._slot_buffers)
+        finally:
+            streamer.exit()
+
+
 # ---------------------------------------------------------------------------
 # DiT checkpoint loading straight into the model (LOW g)
 # ---------------------------------------------------------------------------
@@ -574,3 +871,115 @@ def test_streamed_checkpoint_load_casts_into_model_and_keeps_key_semantics(tmp_p
     save_file(wrong, str(path))
     with pytest.raises(ValueError, match="Incompatible DiT tensor shapes"):
         load(_bf16_model(), path, _bf16_model().state_dict(), lambda key: key, None)
+
+
+# ---------------------------------------------------------------------------
+# Resident-VAE warning (A-L7)
+# ---------------------------------------------------------------------------
+def _warnings_during(callable_):
+    from loguru import logger
+
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    try:
+        callable_()
+    finally:
+        logger.remove(sink)
+    return messages
+
+
+def test_block_streaming_warns_when_the_vae_stays_resident():
+    from hymm.utils.streaming_config import validate_streaming_config
+
+    resident_vae = _compose(
+        "+experiment=single_gpu_bf16_16gb_inference",
+        "model.vae.name=dcae-v-f32t4c32", "model.vae.layer_streaming=false",
+    )
+    messages = _warnings_during(lambda: validate_streaming_config(resident_vae))
+    assert any("stays resident" in m and "2.4 GB" in m for m in messages)
+    preset = _compose("+experiment=single_gpu_bf16_16gb_inference")
+    assert not any("stays resident" in m for m in _warnings_during(lambda: validate_streaming_config(preset)))
+
+
+# ---------------------------------------------------------------------------
+# Host-staged KV pre-flight arithmetic (B-H1)
+# ---------------------------------------------------------------------------
+TOKENS_720P = 880  # 22 x 40 latent tokens per frame at 704x1280
+
+
+def test_kv_estimates_match_the_documented_720p_numbers():
+    from hymm.utils.streaming_config import (
+        estimate_host_staged_kv_gpu_bytes,
+        estimate_host_staged_kv_host_bytes,
+        kv_layer_token_bytes,
+    )
+
+    assert kv_layer_token_bytes(16, 128) == 8192
+    per_frame = estimate_host_staged_kv_gpu_bytes(
+        history_tokens=TOKENS_720P, cache_heads=16, head_dim=128, slots=2, guidance_batch=1,
+    )
+    assert per_frame == 3 * 8192 * TOKENS_720P  # ~22 MB per latent frame at B=1
+    with_cfg = estimate_host_staged_kv_gpu_bytes(
+        history_tokens=TOKENS_720P, cache_heads=16, head_dim=128, slots=2, guidance_batch=2,
+    )
+    assert 28e6 < with_cfg < 30e6
+    host = estimate_host_staged_kv_host_bytes(
+        capacity_tokens=TOKENS_720P, num_layers=54, cache_heads=16, head_dim=128,
+    )
+    assert 388e6 < host < 390e6  # ~389 MB per latent frame
+
+
+def test_max_history_tokens_is_the_inverse_of_the_estimate():
+    from hymm.utils.streaming_config import estimate_host_staged_kv_gpu_bytes, max_history_tokens_for
+
+    common = dict(cache_heads=16, head_dim=128, slots=2, guidance_batch=3, extra_tokens=17_856)
+    budget = 9 * 2**30
+    tokens = max_history_tokens_for(budget_bytes=budget, **common)
+    assert estimate_host_staged_kv_gpu_bytes(history_tokens=tokens, **common) <= budget
+    assert estimate_host_staged_kv_gpu_bytes(history_tokens=tokens + 1, **common) > budget
+    assert max_history_tokens_for(budget_bytes=-1, **common) == 0
+
+
+def _preflight_args(**overrides):
+    args = dict(
+        history_tokens=600 * TOKENS_720P, extra_tokens=20 * TOKENS_720P + 256,
+        activation_tokens=20 * TOKENS_720P + 256, history_latent_frames=600,
+        cache_heads=16, head_dim=128, slots=2, guidance_batch=1, num_layers=54,
+        capacity_tokens=620 * TOKENS_720P + 256, resident_bytes=int(1.6 * 2**30), fps=24.0,
+    )
+    args.update(overrides)
+    return args
+
+
+def test_preflight_rejects_a_history_that_cannot_fit():
+    from hymm.utils.streaming_config import KV_PREFLIGHT_ACTIVATION_BYTES_PER_TOKEN, host_staged_kv_preflight
+
+    estimate = host_staged_kv_preflight(**_preflight_args())
+    assert estimate["fits"] is None and estimate["free_bytes"] is None
+    assert estimate["activation_bytes"] == KV_PREFLIGHT_ACTIVATION_BYTES_PER_TOKEN * (20 * TOKENS_720P + 256)
+    assert estimate["predicted_bytes"] == (
+        estimate["resident_bytes"] + estimate["kv_gpu_bytes"] + estimate["activation_bytes"]
+    )
+    free = 8 * 2**30
+    with pytest.raises(ValueError) as error:
+        host_staged_kv_preflight(**_preflight_args(free_bytes=free))
+    message = str(error.value)
+    assert "8.00 GiB is free" in message and "latent frames" in message and "fps" in message
+    assert "kv_cache_host_staging_preflight=false" in message
+    report = host_staged_kv_preflight(**_preflight_args(free_bytes=free), enforce=False)
+    assert report["fits"] is False and 0 < report["max_latent_frames"] < 600
+    assert report["max_seconds"] == pytest.approx(report["max_latent_frames"] * 4 / 24.0)
+    assert f"At most {report['max_latent_frames']} latent frames" in message
+    # The reported maximum really fits.
+    frames = report["max_latent_frames"]
+    shorter = host_staged_kv_preflight(**_preflight_args(
+        free_bytes=free, history_tokens=frames * TOKENS_720P, history_latent_frames=frames,
+    ))
+    assert shorter["fits"]
+
+
+def test_preflight_passes_with_enough_free_memory():
+    from hymm.utils.streaming_config import host_staged_kv_preflight
+
+    report = host_staged_kv_preflight(**_preflight_args(free_bytes=64 * 2**30))
+    assert report["fits"] and report["max_latent_frames"] >= 600

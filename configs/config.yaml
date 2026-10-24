@@ -369,8 +369,22 @@ inference:
   # Exact BF16 lifelong KV history in pinned host memory, staged per layer into
   # a small GPU ring as the block loop reaches each layer (small-GPU path).
   # Requires kv_cache_quantization=none, sliding_window disabled, seg_ar/chunk_ar.
+  # GPU memory still grows with the history (T tokens; B = guidance batch, 1
+  # without CFG): each staging slot holds one layer's whole history and the DiT
+  # materializes the broadcast history once per guidance row, so
+  #   GPU  ~= base + (slots + B) x 2 x heads x head_dim x 2 bytes x T
+  #   host ~=   54 x              2 x heads x head_dim x 2 bytes x T
+  # At 720p (880 tokens per latent frame, 8192 B per token and layer): ~22 MB
+  # of GPU per latent frame at slots=2, B=1 (~130 MB per second of video), and
+  # ~389 MB of host RAM per latent frame.
   kv_cache_host_staging: false
   kv_cache_host_staging_slots: 2
+  # Before building a host-staged cache, compare the predicted DiT-phase GPU
+  # peak (resident DiT slots + the KV working set above at the request's
+  # maximum history + ~48 KiB per token of the longest chunk per guidance row
+  # for activations) with free GPU memory and fail early, naming the longest
+  # history that fits. false skips the check (the estimate is still logged).
+  kv_cache_host_staging_preflight: true
   qvg_kv_cache:
     preset: upstream_default   # quant-videogen==0.1.0 real Triton PRQ codec
     text_storage: int8         # int8 | bf16; QVG only compresses video KV
@@ -522,13 +536,18 @@ inference:
   reference_image: null            # path to a PNG/JPEG, or null
   reference_prompt: null           # JSON segment prompt or plain caption; null derives one from segment 0
   reference_latent_frames: 4       # latent frames of the static reference clip (4 = 16 pixel frames)
+  # GPU peak of the encode (encoder-only load): ~1.7 GiB of BF16 weights
+  # (916.7M params) + ~0.75 GiB of activations per pixel frame at 704x1280
+  # (scales with the pixel area), capped at the 40-frame DCAE-V chunk, before
+  # cuDNN workspace.
   # false: encode 4 pixel frames (one latent frame) and repeat the latent. The
   #   DCAE-V causal chunk is 40 pixel frames, so this is a boundary-padded
-  #   chunk (an approximation). Single-chunk GPU peak ~6.5 GiB (weights +
-  #   activations at 720p with the encoder-only load).
+  #   chunk (an approximation). Single-chunk peak ~4.7 GiB + workspace; budget
+  #   ~6.5 GiB at 720p.
   # true: encode all 4*reference_latent_frames frames at once (real temporal
-  #   context; ~11 GiB peak for reference_latent_frames=4 with the encoder-only
-  #   load). Set it when GPU memory allows.
+  #   context). ~14 GiB for reference_latent_frames=4 at 720p (16 pixel frames),
+  #   so it does not fit a 16 GB card at 720p. When the estimate exceeds free
+  #   GPU memory the pipeline warns and falls back to the single-chunk encode.
   reference_encode_full_clip: false
   # DCAE-V checkpoint (dc-ae-v-1.0-f32t4c32-bf16.pt) for the encoder. Required
   # when model.vae.name=pixelumm, since PixelUMM is decoder-only. Only the

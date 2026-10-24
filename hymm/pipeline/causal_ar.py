@@ -708,9 +708,13 @@ class CPTCausalInferencePipeline(BasePipeline):
                 f"{self.max_cache_segments} segments"
             )
         if self.cache_at_step >= 0:
+            # The reference has no denoise trajectory to snapshot; it is written
+            # at cache_noise_sigma like a finished segment (clean when 0).
             logger.info(
                 "cache_at_step is set: generated segments are cached from denoise step "
-                f"{self.cache_at_step}, but the reference clip is written clean (sigma=0)"
+                f"{self.cache_at_step}; the reference clip is written with "
+                f"cache_noise_sigma={self.cache_noise_sigma:.6f} "
+                f"(timestep {self.cache_noise_sigma * 1000.0:.1f})"
             )
         # The KV cache holds one slot per guidance branch unless the seg_ar
         # single-slot CFG cache is on; give every branch the same conditional
@@ -785,6 +789,107 @@ class CPTCausalInferencePipeline(BasePipeline):
             f"sigma={self.cache_noise_sigma:.6f}, {time.time() - started:.2f}s"
         )
         return video_range
+
+    @contextmanager
+    def _host_staging_scope(self):
+        """Free the host-staged KV staging ring when the DiT phase ends, even on error.
+
+        Decode must not share the GPU with the ring (segment VAE decode is
+        rejected with host staging), and an exception during generation must
+        not leave several GB of staging on the GPU of a long-lived server.
+        """
+        try:
+            yield
+        finally:
+            if isinstance(self.kv_cache, HostStagedKVCache):
+                self.kv_cache.release_staging()
+
+    def _dit_phase_resident_bytes(self) -> int:
+        """GPU weight bytes the DiT phase will add (0 when the DiT is already resident)."""
+        streamer = getattr(self.transformer, "_module_streamer", None)
+        if streamer is not None and hasattr(streamer, "phase_device_bytes"):
+            # Slot ring + resident blocks + embedders/final layer; nothing of it
+            # is allocated before the residency scope enters.
+            return 0 if getattr(streamer, "active", False) else int(streamer.phase_device_bytes())
+        # Whole-model offload: whatever still lives on the host comes over.
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in list(self.transformer.parameters()) + list(self.transformer.buffers())
+            if tensor.device.type == "cpu"
+        )
+
+    def _host_staged_kv_preflight(
+        self,
+        *,
+        history_tokens: int,
+        capacity_tokens: int,
+        activation_tokens: int,
+        history_latent_frames: int,
+        cache_batch: int,
+        guidance_batch: int,
+    ) -> dict:
+        """Log the host-staged KV estimate and fail early if the DiT phase cannot fit.
+
+        See ``hymm.utils.streaming_config.host_staged_kv_preflight`` for the
+        formula. The check runs only with CUDA and
+        ``inference.kv_cache_host_staging_preflight`` (default true).
+        """
+        from hymm.utils.streaming_config import host_staged_kv_preflight
+
+        inference_args = self.args.inference
+        head_dim = self.hidden_size // self.heads_num
+        cache_heads = (
+            self.heads_num // nccl_info.sp_size if get_sequence_parallel_state() else self.heads_num
+        )
+        staging_slots = getattr(inference_args, "kv_cache_host_staging_slots", None)
+        slots = 2 if staging_slots is None else int(staging_slots)
+        preflight = getattr(inference_args, "kv_cache_host_staging_preflight", True)
+        enforce = True if preflight is None else bool(preflight)
+        fps = float(getattr(inference_args, "video_fps", None) or getattr(self.args, "video_fps", 24))
+        dtype_bytes = torch.empty((), dtype=self.target_dtype).element_size()
+        free_bytes = None
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            # Reserved-but-unallocated blocks are reusable by this process too.
+            free_bytes = int(torch.cuda.mem_get_info(self.device)[0]) + max(
+                0, torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
+            )
+        # The per-layer GPU cache masks are allocated with the cache.
+        resident_bytes = self._dit_phase_resident_bytes() + (
+            self.num_double_blocks * int(cache_batch) * int(capacity_tokens)
+        )
+        common = dict(
+            history_tokens=history_tokens,
+            extra_tokens=max(0, int(capacity_tokens) - int(history_tokens)),
+            activation_tokens=activation_tokens,
+            history_latent_frames=history_latent_frames,
+            cache_heads=cache_heads,
+            head_dim=head_dim,
+            slots=slots,
+            guidance_batch=guidance_batch,
+            num_layers=self.num_double_blocks,
+            capacity_tokens=capacity_tokens,
+            resident_bytes=resident_bytes,
+            free_bytes=free_bytes,
+            fps=fps,
+            pixel_frames_per_latent=int(getattr(self, "t_ratio", 4) or 4),
+            cache_batch=cache_batch,
+            dtype_bytes=dtype_bytes,
+        )
+        estimate = host_staged_kv_preflight(enforce=False, **common)
+        gib = 2**30
+        logger.info(
+            "Host-staged KV estimate: GPU KV working set at the request's max history "
+            f"({int(history_tokens)} tokens) ~{estimate['kv_gpu_bytes'] / gib:.2f} GiB "
+            f"[(slots={slots} + B={int(guidance_batch)}) x 2 x {cache_heads} heads x {head_dim} "
+            f"x {dtype_bytes} B per token], activations ~{estimate['activation_bytes'] / gib:.2f} GiB, "
+            f"resident DiT ~{estimate['resident_bytes'] / gib:.2f} GiB, predicted "
+            f"~{estimate['predicted_bytes'] / gib:.2f} GiB"
+            + (f" of {estimate['free_bytes'] / gib:.2f} GiB free" if free_bytes is not None else "")
+            + f"; host KV {estimate['host_kv_bytes'] / gib:.2f} GiB pinned"
+        )
+        if enforce and free_bytes is not None:
+            host_staged_kv_preflight(enforce=True, **common)
+        return estimate
 
     @contextmanager
     def _kv_forward(self, *, update: bool, extra_tokens: int = 0):
@@ -2354,6 +2459,23 @@ class CPTCausalInferencePipeline(BasePipeline):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # Host-staged KV keeps GPU memory growing with the history (staging
+        # slots + the DiT's broadcast copies); check the request fits before
+        # pinning tens of GB of host memory for it.
+        if (bool(getattr(self.args.inference, "kv_cache_host_staging", False))
+                and not continuing_session and not swa_enabled):
+            self._host_staged_kv_preflight(
+                history_tokens=request_cache_tokens,
+                capacity_tokens=max_cache_tokens,
+                activation_tokens=max_img_tokens_per_chunk + text_len,
+                history_latent_frames=reference_frames + (
+                    self.max_cache_segments * max_chunk_latent_frames
+                    if self.max_cache_segments is not None else latent_frames
+                ),
+                cache_batch=persistent_cache_batch,
+                guidance_batch=cfg_batch,
+            )
+
         # Text encoder is off the GPU: allocate (or continue) the persistent KV
         # history now, right before the DiT phase.
         _prepare_persistent_kv_cache()
@@ -2381,7 +2503,9 @@ class CPTCausalInferencePipeline(BasePipeline):
 
         # All text encoding is complete. Keep camera projections and every
         # denoise/cache-write forward in one DiT residency phase, before VAE.
-        with self._dit_denoise_residency():
+        # The staging scope is outermost: the KV staging ring is released after
+        # the DiT weights leave the GPU, also when generation raises.
+        with self._host_staging_scope(), self._dit_denoise_residency():
             # ========== Camera control: preprocess full keyboard once ==========
             # Mirrors the one_shot (bidirectional) pipeline: build the full-clip
             # camera tensors and preprocess them into the per-latent-frame keyboard
@@ -3616,11 +3740,6 @@ class CPTCausalInferencePipeline(BasePipeline):
                 )
 
             generation_end = time.time()
-
-        if isinstance(self.kv_cache, HostStagedKVCache):
-            # The DiT phase is over; decode must not share the GPU with the
-            # KV staging ring (segment VAE decode is rejected with host staging).
-            self.kv_cache.release_staging()
 
         logger.info(f"\n{'=' * 60}")
         logger.info(f"PROFILING SUMMARY")

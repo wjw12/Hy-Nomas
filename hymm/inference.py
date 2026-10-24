@@ -50,6 +50,7 @@ from configs.config import parse_args as _hydra_parse_args
 from hymm.utils.video_output import video_to_uint8_numpy
 from hymm.utils.inference_metrics import InferenceMetrics, stage, tensor_storage_bytes
 from hymm.utils.inference_mode import offline_sample_mode
+from hymm.utils.reference_image import resolve_reference_entry, resolve_reference_image_path
 
 
 # ============================================================================
@@ -1243,16 +1244,11 @@ def _load_from_json(
 
         # Per-entry reference image for KV-cache seeding; relative paths are
         # resolved against the directory of the prompt JSON.
-        reference_image = item.get("reference_image")
-        if reference_image:
-            reference_path = Path(str(reference_image)).expanduser()
-            if not reference_path.is_absolute():
-                reference_path = (json_path.parent / reference_path).resolve()
-            if not reference_path.is_file():
-                raise FileNotFoundError(
-                    f"[{test_id}] reference_image does not exist: {reference_path}"
-                )
-            entry_meta["reference_image"] = str(reference_path)
+        reference_path = resolve_reference_image_path(
+            item.get("reference_image"), json_path.parent, label=test_id,
+        )
+        if reference_path:
+            entry_meta["reference_image"] = reference_path
 
         if not desc_field_first and not desc_field_rest:
             raw_segments = item.get("segments", [])
@@ -2162,41 +2158,15 @@ def main():
             )
 
         # ---- Reference image (KV-cache seeding) ----
-        inference_cfg = args.inference
-        effective_reference_image = (
-            (entry_meta or {}).get("reference_image")
-            or getattr(inference_cfg, "reference_image", None)
+        # The loader already resolved entry images against the prompt JSON's
+        # directory, so no json_dir here.
+        reference_spec = resolve_reference_entry(
+            entry_meta, None, args.inference, rollout_type=rollout_type,
         )
-        effective_reference_prompt = (
-            (entry_meta or {}).get("reference_prompt")
-            or getattr(inference_cfg, "reference_prompt", None)
-        )
-        if isinstance(effective_reference_prompt, (dict, list)):
-            # A structured JSON prompt given inline in the prompt file.
-            effective_reference_prompt = json.dumps(effective_reference_prompt, ensure_ascii=False)
-        effective_reference_frames = 4
+        effective_reference_image = reference_spec.image
+        effective_reference_prompt = reference_spec.prompt
+        effective_reference_frames = reference_spec.latent_frames
         if effective_reference_image:
-            raw_frames = (entry_meta or {}).get("reference_latent_frames")
-            if raw_frames is None:
-                raw_frames = getattr(inference_cfg, "reference_latent_frames", None)
-            if raw_frames is not None:
-                try:
-                    parsed_frames = float(str(raw_frames).strip())
-                except ValueError:
-                    parsed_frames = float("nan")
-                if not parsed_frames.is_integer():
-                    raise ValueError(
-                        f"reference_latent_frames must be a positive integer, got {raw_frames!r}"
-                    )
-                effective_reference_frames = int(parsed_frames)
-            if effective_reference_frames <= 0:
-                raise ValueError(
-                    f"reference_latent_frames must be a positive integer, got {raw_frames!r}"
-                )
-            if rollout_type == "one_shot":
-                raise ValueError(
-                    "reference_image seeding requires rollout_type seg_ar or chunk_ar"
-                )
             logger.info(
                 f"  Reference image: {effective_reference_image} "
                 f"({effective_reference_frames} latent frames, "
@@ -2336,7 +2306,8 @@ def main():
             clear_range_cache()
 
         kv_audit = getattr(pipeline, "_last_kv_optimization_audit", None)
-        if kv_audit and (kv_audit["int8_kv"] or kv_audit.get("qvg_kv", False) or kv_audit["swa"]):
+        if kv_audit and (kv_audit["int8_kv"] or kv_audit.get("qvg_kv", False) or kv_audit["swa"]
+                         or kv_audit.get("host_staged_kv")):
             Path(output_path).with_suffix(f".kv.rank{rank}.json").write_text(
                 json.dumps(dict(kv_audit, rank=rank), indent=2) + "\n"
             )

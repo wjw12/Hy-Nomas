@@ -46,6 +46,17 @@ _PAGE = 4096  # host page size; registered ranges never share a page
 # ---------------------------------------------------------------------------
 # Exact-size pinned host memory
 # ---------------------------------------------------------------------------
+_CUDA_ERROR_NOT_SUPPORTED = 801  # cudaErrorNotSupported (some WSL / vGPU / container setups)
+
+# cudaHostRegister state shared by every allocation of the process. Once
+# registration is known not to work (unsupported, or the very first attempt
+# failed) the remaining few hundred allocations go straight to the fallback
+# instead of each failing (and logging) again.
+_HOST_REGISTER_DISABLED = False
+_HOST_REGISTER_SUCCEEDED = False
+_FALLBACK_WARNED = False
+
+
 def _cuda_error_code(result) -> int:
     value = getattr(result, "value", result)
     try:
@@ -54,19 +65,51 @@ def _cuda_error_code(result) -> int:
         return 0 if result is None else 1
 
 
+def _clear_pending_cuda_error(cudart=None) -> None:
+    """Consume the CUDA error a failed runtime call left on this thread.
+
+    PyTorch's ``cudart()`` binding returns the error code but does not reset
+    the thread's last-error state, so without this the next unrelated kernel
+    launch raises ``RuntimeError: CUDA error``. ``cudaGetLastError`` is used
+    when the binding exposes it (current PyTorch builds do not); otherwise a
+    trivial kernel is launched inside a ``try``: PyTorch's launch check reads,
+    and thereby clears, the pending error and raises it, which is swallowed.
+    """
+    get_last_error = getattr(cudart, "cudaGetLastError", None) if cudart is not None else None
+    if get_last_error is not None:
+        try:
+            get_last_error()
+            return
+        except Exception:  # noqa: BLE001 - fall through to the kernel probe
+            pass
+    try:
+        torch.empty(1, device="cuda").zero_()
+    except Exception:  # noqa: BLE001 - the probe exists to absorb this error
+        pass
+
+
 def _unregister_host(ptr: int, storage_keepalive) -> None:
     """Finalizer: unpin a registered range once its owning tensor is dropped.
 
     ``storage_keepalive`` (the untyped storage, not the tensor) keeps the
     memory allocated until the range has been unregistered.
     """
+    cudart = None
     try:
         if torch.cuda.is_initialized():
             # A non_blocking copy may still be reading the range.
             torch.cuda.synchronize()
-        torch.cuda.cudart().cudaHostUnregister(ptr)
+        cudart = torch.cuda.cudart()
+        error = _cuda_error_code(cudart.cudaHostUnregister(ptr))
+        if error != 0:
+            _clear_pending_cuda_error(cudart)
+            logger.debug(f"cudaHostUnregister failed with error {error}")
     except Exception:  # noqa: BLE001 - interpreter shutdown / driver teardown
-        pass
+        if cudart is not None:
+            try:
+                _clear_pending_cuda_error(cudart)
+            except Exception:  # noqa: BLE001
+                pass
     del storage_keepalive
 
 
@@ -87,9 +130,15 @@ def allocate_pinned_exact(
     ``is_pinned() == True`` and makes ``non_blocking`` copies asynchronous.
 
     Falls back to ``pin_memory=True`` and then to pageable memory (with a
-    warning) if registration fails. Without CUDA the result is pageable and
-    nothing is logged. Returns ``(tensor, pinned)``.
+    warning) if registration fails. The pending CUDA error of a failed
+    register / unregister call is consumed so later kernels are unaffected.
+    After an "unsupported" result, or when the first registration of the
+    process fails, registration is skipped for every later allocation.
+    Without CUDA the result is pageable and nothing is logged. Returns
+    ``(tensor, pinned)``.
     """
+    global _HOST_REGISTER_DISABLED, _HOST_REGISTER_SUCCEEDED, _FALLBACK_WARNED
+
     shape = [int(shape)] if isinstance(shape, int) else [int(s) for s in shape]
     numel = 1
     for size in shape:
@@ -99,28 +148,54 @@ def allocate_pinned_exact(
         return torch.empty(shape, dtype=dtype, device="cpu"), False
 
     padded = (nbytes + _PAGE - 1) // _PAGE * _PAGE
-    try:
-        base = torch.empty(padded + _PAGE, dtype=torch.uint8, device="cpu")
-        offset = (-base.data_ptr()) % _PAGE
-        region = base[offset : offset + padded]
-        ptr = region.data_ptr()
-        error = _cuda_error_code(torch.cuda.cudart().cudaHostRegister(ptr, padded, 0))
-        if error == 0:
-            tensor = region[:nbytes].view(dtype).view(shape)
-            finalizer = weakref.finalize(tensor, _unregister_host, ptr, region.untyped_storage())
-            # Process exit releases the pages anyway; do not call into a CUDA
-            # context that may already be torn down.
-            finalizer.atexit = False
-            return tensor, True
-        logger.warning(f"cudaHostRegister({padded} bytes) failed with error {error}")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"cudaHostRegister({padded} bytes) failed: {exc}")
+    if not _HOST_REGISTER_DISABLED:
+        base = None
+        try:
+            base = torch.empty(padded + _PAGE, dtype=torch.uint8, device="cpu")
+        except RuntimeError as exc:
+            # Not a registration failure: the host is out of pageable memory.
+            logger.warning(f"Host allocation of {padded} bytes failed: {exc}")
+        if base is not None:
+            offset = (-base.data_ptr()) % _PAGE
+            region = base[offset : offset + padded]
+            ptr = region.data_ptr()
+            cudart = None
+            try:
+                cudart = torch.cuda.cudart()
+                error = _cuda_error_code(cudart.cudaHostRegister(ptr, padded, 0))
+                failure = f"error {error}"
+            except Exception as exc:  # noqa: BLE001
+                error, failure = -1, str(exc)
+            if error == 0:
+                tensor = region[:nbytes].view(dtype).view(shape)
+                finalizer = weakref.finalize(tensor, _unregister_host, ptr, region.untyped_storage())
+                # Process exit releases the pages anyway; do not call into a CUDA
+                # context that may already be torn down.
+                finalizer.atexit = False
+                _HOST_REGISTER_SUCCEEDED = True
+                return tensor, True
+            _clear_pending_cuda_error(cudart)
+            # Drop the unregistered buffer before the fallback allocates, so
+            # the host footprint never holds two copies of the range.
+            base = region = None
+            logger.warning(f"cudaHostRegister({padded} bytes) failed: {failure}")
+            if error == _CUDA_ERROR_NOT_SUPPORTED or not _HOST_REGISTER_SUCCEEDED:
+                _HOST_REGISTER_DISABLED = True
+                logger.warning(
+                    "cudaHostRegister is disabled for the remaining host allocations "
+                    "of this process; using the fallback allocator"
+                )
     try:
         tensor = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-        logger.warning(
+        message = (
             "Falling back to torch pin_memory=True; the caching host allocator "
             f"rounds {nbytes} bytes up to the next power of two"
         )
+        if _FALLBACK_WARNED:
+            logger.debug(message)
+        else:
+            logger.warning(message)
+            _FALLBACK_WARNED = True
         return tensor, True
     except RuntimeError as exc:
         logger.warning(f"Pinned host allocation failed ({exc}); using pageable memory")
@@ -260,6 +335,7 @@ class _Packed:
             offset += _round_up(nbytes)
         self.nbytes = offset
         self.host: Optional[torch.Tensor] = None
+        self.host_views: List[torch.Tensor] = []
         self.pinned = False
 
     def pack_to_host(self, pin_memory: bool) -> None:
@@ -276,6 +352,8 @@ class _Packed:
             view.copy_(tensor.detach().to("cpu"))
             tensor.data = view
         self.host = host
+        # Precomputed so a unit released mid-phase can be rebound cheaply.
+        self.host_views = self.views_into(host)
 
     def views_into(self, flat: torch.Tensor) -> List[torch.Tensor]:
         return [
@@ -289,7 +367,7 @@ class _Packed:
 
     def bind_host(self) -> None:
         assert self.host is not None
-        self.bind(self.views_into(self.host))
+        self.bind(self.host_views or self.views_into(self.host))
 
 
 def _check_frozen(modules: Iterable[nn.Module], tensors: Iterable[torch.Tensor]) -> None:
@@ -472,7 +550,7 @@ class ModuleStreamer:
         started = time.perf_counter()
         with stage(self.stage_prefix + "_H2D"), torch.inference_mode(False), torch.no_grad():
             self._copy_stream = torch.cuda.Stream(device=self.device)
-            n_slots = self.slots if self.scheduler is not None else 0
+            n_slots = self._phase_slot_count()
             self._slot_buffers = [
                 torch.empty(self.unit_bytes, dtype=torch.uint8, device=self.device)
                 for _ in range(n_slots)
@@ -504,6 +582,38 @@ class ModuleStreamer:
         self.transfer_seconds += time.perf_counter() - started
         self.gpu_transfers += 1
         self.phases += 1
+
+    def _phase_slot_count(self) -> int:
+        """GPU slot buffers a phase allocates.
+
+        When every streamed unit owns a slot (``n <= slots - 1``) slots are
+        indexed by position, so only ``n`` of them are ever used.
+        """
+        if self.scheduler is None:
+            return 0
+        return len(self.scheduler) if self.scheduler.all_fit else self.slots
+
+    def phase_device_bytes(self) -> int:
+        """Weight bytes a phase holds on the GPU (slot ring + resident units/modules).
+
+        Valid before ``enter()``, so callers can budget GPU memory ahead of the phase.
+        """
+        total = self._phase_slot_count() * self.unit_bytes
+        total += sum(self.packed[unit].nbytes for unit in range(self.resident_units))
+        if self.resident_packed is not None:
+            total += self.resident_packed.nbytes
+        return total
+
+    def _bind_host(self, unit: int) -> None:
+        """Point a unit that left its slot back at its host copy.
+
+        A later access outside the hooked ``__call__`` then fails with a device
+        mismatch instead of silently computing with whatever unit the slot is
+        being refilled with.
+        """
+        with torch.inference_mode(False), torch.no_grad():
+            packed = self.packed[unit]
+            packed.bind(packed.host_views)
 
     def exit(self) -> None:
         if self.depth == 0:
@@ -600,6 +710,8 @@ class ModuleStreamer:
             # copy stream and restart the ring from here.
             self.resyncs += 1
             torch.cuda.synchronize(self.device)
+            for bound_unit in list(self._bound_unit_slot):
+                self._bind_host(bound_unit)
             self._free_events = {}
             self._ready_events = {}
             self._bound_unit_slot = {}
@@ -618,6 +730,7 @@ class ModuleStreamer:
                 event = torch.cuda.Event()
                 event.record(compute)
                 self._free_events[released_slot] = event
+                self._bind_host(released)
         if prefetch is not None:
             prefetch_unit, prefetch_slot = prefetch
             if self._slot_occupant[prefetch_slot] != prefetch_unit:

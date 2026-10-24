@@ -438,6 +438,17 @@ class BasePipeline(nn.Module):
 
         return load_reference_frames(image_path, height=height, width=width, frames=frames)
 
+    def _reference_sp_group(self):
+        """``(group, rank_within_group)`` of this rank's SP group, or ``None`` without SP."""
+        import torch.distributed as dist
+        from hymm.distributed.parallel_states import nccl_info
+
+        sp_size = int(getattr(nccl_info, "sp_size", 1) or 1)
+        group = getattr(nccl_info, "sp_group", None)
+        if sp_size <= 1 or group is None or not (dist.is_available() and dist.is_initialized()):
+            return None
+        return group, int(getattr(nccl_info, "rank_within_spgroup", 0) or 0)
+
     def _encode_reference_image_latent(
         self,
         image_path: str,
@@ -449,24 +460,97 @@ class BasePipeline(nn.Module):
     ) -> torch.Tensor:
         """Encode a still image into ``[1, 32, latent_frames, latent_h, latent_w]`` DCAE-V latents.
 
+        With sequence parallelism only SP rank 0 loads the encoder and encodes;
+        the latent is broadcast over the SP group so every rank seeds the KV
+        history with identical bits (independent encodes could differ through
+        cuDNN algorithm choice) and the other ranks skip the encoder's memory.
+        Without SP (or without an initialized process group) this is a plain
+        local encode, see ``_encode_reference_image_latent_local``.
+        """
+        kwargs = dict(
+            latent_h=latent_h, latent_w=latent_w, latent_frames=latent_frames,
+            encode_full_clip=encode_full_clip,
+        )
+        sp = self._reference_sp_group()
+        if sp is None:
+            return self._encode_reference_image_latent_local(image_path, **kwargs)
+        import torch.distributed as dist
+
+        group, rank = sp
+        source = int(dist.get_global_rank(group, 0)) if hasattr(dist, "get_global_rank") else 0
+        # [ok, *shape]: peers learn the shape (and any rank-0 failure) first,
+        # so a failed encode raises on every rank instead of hanging the group.
+        header = torch.zeros(6, dtype=torch.int64, device=self.device)
+        latent, error = None, None
+        if rank == 0:
+            try:
+                latent = self._encode_reference_image_latent_local(image_path, **kwargs).contiguous()
+                header[0] = 1
+                header[1:] = torch.tensor(list(latent.shape), dtype=torch.int64)
+            except Exception as exc:  # noqa: BLE001 - re-raised below, after the peers know
+                error = exc
+        dist.broadcast(header, src=source, group=group)
+        if int(header[0].item()) != 1:
+            if error is not None:
+                raise error
+            raise RuntimeError("reference image encoding failed on SP rank 0")
+        if rank != 0:
+            shape = [int(value) for value in header[1:].tolist()]
+            latent = torch.empty(shape, dtype=self.target_dtype, device=self.device)
+        dist.broadcast(latent, src=source, group=group)
+        return latent
+
+    def _encode_reference_image_latent_local(
+        self,
+        image_path: str,
+        *,
+        latent_h: int,
+        latent_w: int,
+        latent_frames: int,
+        encode_full_clip: bool = False,
+    ) -> torch.Tensor:
+        """Encode on this rank (see ``_encode_reference_image_latent``).
+
         The image is treated as a static clip. By default 4 pixel frames are
         encoded (one latent frame) and repeated ``latent_frames`` times. The
         DCAE-V causal chunk is 40 pixel frames, so a 4-frame encode is a
         boundary-padded chunk: an approximation of what the encoder produces
         inside a real clip. With ``encode_full_clip`` the whole
         ``4 * latent_frames``-frame clip goes through the chunk-causal encoder
-        in one pass; set ``inference.reference_encode_full_clip=true`` when GPU
-        memory allows. A separately loaded encoder (PixelUMM runs) is built
-        encoder-only and dropped afterwards.
+        in one pass (~1.7 GiB weights + ~0.75 GiB per pixel frame at 720p,
+        capped at the 40-frame chunk); when that estimate exceeds free GPU
+        memory the single-chunk encode is used instead, with a warning. A
+        separately loaded encoder (PixelUMM runs) is built encoder-only and
+        dropped afterwards.
         """
         from hymm.models.vae.autoencoder_dcae_v import AutoencoderDCAEV
+        from hymm.utils.reference_image import DCAEV_ENCODER_BF16_BYTES, choose_reference_full_clip
 
         t_ratio = int(getattr(self, "t_ratio", 4) or 4)
         s_ratio = int(getattr(self, "s_ratio", 32) or 32)
         height, width = latent_h * s_ratio, latent_w * s_ratio
+        resident_encoder = isinstance(self.vae, AutoencoderDCAEV)
+        if encode_full_clip and torch.cuda.is_available() and self.device.type == "cuda":
+            free_bytes = int(torch.cuda.mem_get_info(self.device)[0]) + max(
+                0, torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
+            )
+            fits, estimate = choose_reference_full_clip(
+                True, latent_frames=latent_frames, t_ratio=t_ratio, height=height, width=width,
+                free_bytes=free_bytes,
+                # A resident DCAE-V already has its weights on the GPU.
+                weight_bytes=0 if resident_encoder else DCAEV_ENCODER_BF16_BYTES,
+            )
+            if not fits:
+                logger.warning(
+                    "reference_encode_full_clip: the full-clip encode of "
+                    f"{t_ratio * latent_frames} pixel frames at {height}x{width} needs "
+                    f"~{estimate / 2**30:.1f} GiB but only {free_bytes / 2**30:.1f} GiB of GPU "
+                    "memory is free; falling back to the single-chunk encode (repeated latent)"
+                )
+                encode_full_clip = False
         frames = t_ratio * (latent_frames if encode_full_clip else 1)
 
-        encoder = self.vae if isinstance(self.vae, AutoencoderDCAEV) else None
+        encoder = self.vae if resident_encoder else None
         owned = False
         if encoder is None:
             checkpoint = getattr(self.args.inference, "reference_vae_checkpoint", None)
