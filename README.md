@@ -42,6 +42,7 @@ https://github.com/user-attachments/assets/e7a2528c-4ccc-461c-8f09-207650f1f0bd
   - [Model Assets](#model-assets)
   - [Inference](#inference)
     - [Inference with Low-Mem GPU](#inference-with-low-mem-gpu)
+    - [BF16 Inference on a 16 GB GPU (experimental)](#bf16-inference-on-a-16-gb-gpu-experimental)
   - [Interactive Demo](#interactive-demo)
 - [LoRA Fine-Tuning](#lora-fine-tuning)
   - [SFT Data Preparation](#sft-data-preparation)
@@ -161,6 +162,16 @@ bash scripts/inference/inference_from_config.sh configs/experiment/single_gpu_lo
 ```
 
 CPU offload requires enough system RAM for the models and adds CPU–GPU transfer overhead. Peak GPU memory depends on resolution and segment length.
+
+#### BF16 Inference on a 16 GB GPU (experimental)
+
+`configs/experiment/single_gpu_bf16_16gb_inference.yaml` runs the **full BF16 DiT, PixelUMM decoder and text encoder without quantization or a sliding window** on a single 12 to 16 GB card. Memory comes from scheduling only: each model is streamed layer by layer from pinned host memory through a ring of GPU slot buffers (the next layer copies while the current one computes), the KV history lives in pinned host RAM and is staged per layer, and the three phases never share the GPU. The same preset accepts an optional **reference image** (`inference.reference_image`) that is encoded with DCAE-V and written into the KV history as segment 0, so generation is conditioned on it ("KV-cache seeding", no training).
+
+```bash
+bash scripts/inference/inference_from_config.sh configs/experiment/single_gpu_bf16_16gb_inference.yaml   dit_weight="${Hy_Nomas_Model_Path}/DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors"   model.vae.checkpoint="${Hy_Nomas_Model_Path}/VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors"   inference.prompt=/path/to/prompts.json   inference.save_path=./outputs/single_gpu_bf16
+```
+
+It needs native Linux, a PCIe x16 slot and about 64 GB of host RAM for short clips (96 to 128 GB for long rollouts). The GPU KV working set still grows with the history, by roughly 22 MB per 720p latent frame; a pre-flight check refuses requests that would not fit. This path has been verified statically and with CPU unit tests only; see [docs/BF16_16GB_TESTING.md](docs/BF16_16GB_TESTING.md) for the test ladder, what to observe and known limitations, and [docs/LOW_VRAM_FEASIBILITY.md](docs/LOW_VRAM_FEASIBILITY.md) for the design analysis.
 
 ### Interactive Demo
 
