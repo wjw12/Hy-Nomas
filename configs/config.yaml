@@ -511,6 +511,23 @@ inference:
   prompt_shard_strategy: "duration_balanced"
   # Camera control trajectory for inference (trajectory name or JSON file path; null = disabled)
   camera_trajectory: null
+  # ---- Reference image via KV-cache seeding (seg_ar / chunk_ar, no training) ----
+  # Encode a still image with the DCAE-V encoder, repeat it as a short static
+  # "segment 0" and write it into the KV history with the normal cache-write
+  # forward before the first generated segment. Later segments then attend to
+  # it the same way they attend to earlier generated segments. Per-entry JSON
+  # keys reference_image / reference_prompt / reference_latent_frames override
+  # these defaults. The image is resized to cover and center-cropped to the
+  # decoded plane (latent_h*32 x latent_w*32).
+  reference_image: null            # path to a PNG/JPEG, or null
+  reference_prompt: null           # JSON segment prompt or plain caption; null derives one from segment 0
+  reference_latent_frames: 4       # latent frames of the static reference clip (4 = 16 pixel frames)
+  # false: encode one 4-frame chunk and repeat its latent (cheap, ~3 GB peak);
+  # true: encode all 4*reference_latent_frames frames at once (temporal context, higher peak).
+  reference_encode_full_clip: false
+  # DCAE-V checkpoint (dc-ae-v-1.0-f32t4c32-bf16.pt) for the encoder. Required
+  # when model.vae.name=pixelumm, since PixelUMM is decoder-only.
+  reference_vae_checkpoint: null
   # Camera pose normalization at inference. Mirror whatever the training run
   # used (dataset.normalize_* in the training yaml). Leaving these null
   # defers to the root-level (dataset-flattened) value when an inference

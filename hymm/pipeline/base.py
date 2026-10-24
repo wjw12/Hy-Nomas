@@ -420,6 +420,94 @@ class BasePipeline(nn.Module):
             mask = mask.to(dtype=self.target_dtype, device=self.device)
         return states, mask
 
+    # ------------------------------------------------------------------
+    # Reference image -> DCAE-V latent (KV-cache seeding)
+    # ------------------------------------------------------------------
+    def _default_reference_prompt(
+        self, first_prompt: str, seconds: float, caption: Optional[str] = None,
+    ) -> str:
+        from hymm.utils.reference_image import default_reference_prompt
+
+        return default_reference_prompt(first_prompt, seconds, caption=caption)
+
+    @staticmethod
+    def _load_reference_frames(
+        image_path: str, *, height: int, width: int, frames: int,
+    ) -> torch.Tensor:
+        from hymm.utils.reference_image import load_reference_frames
+
+        return load_reference_frames(image_path, height=height, width=width, frames=frames)
+
+    def _encode_reference_image_latent(
+        self,
+        image_path: str,
+        *,
+        latent_h: int,
+        latent_w: int,
+        latent_frames: int,
+        encode_full_clip: bool = False,
+    ) -> torch.Tensor:
+        """Encode a still image into ``[1, 32, latent_frames, latent_h, latent_w]`` DCAE-V latents.
+
+        The image is treated as a static clip. By default one 4-frame chunk is
+        encoded (one latent frame) and repeated ``latent_frames`` times; with
+        ``encode_full_clip`` the whole ``4 * latent_frames``-frame clip goes
+        through the chunk-causal encoder in one pass (more GPU memory).
+        """
+        from hymm.models.vae.autoencoder_dcae_v import AutoencoderDCAEV
+
+        t_ratio = int(getattr(self, "t_ratio", 4) or 4)
+        s_ratio = int(getattr(self, "s_ratio", 32) or 32)
+        height, width = latent_h * s_ratio, latent_w * s_ratio
+        frames = t_ratio * (latent_frames if encode_full_clip else 1)
+
+        encoder = self.vae if isinstance(self.vae, AutoencoderDCAEV) else None
+        owned = False
+        if encoder is None:
+            checkpoint = getattr(self.args.inference, "reference_vae_checkpoint", None)
+            if not checkpoint:
+                raise ValueError(
+                    "reference_image needs the DCAE-V encoder: set "
+                    "inference.reference_vae_checkpoint to dc-ae-v-1.0-f32t4c32-bf16.pt "
+                    "(PixelUMM is decoder-only)"
+                )
+            encoder = AutoencoderDCAEV.from_checkpoint(
+                checkpoint_path=str(checkpoint), dtype=torch.bfloat16, device=self.device,
+            )
+            encoder.eval().requires_grad_(False)
+            owned = True
+        encoder_dtype = next(encoder.parameters()).dtype
+        encoder_device = next(encoder.parameters()).device
+        if encoder_device.type != "cuda":
+            raise RuntimeError(
+                "DCAE-V encoder must be resident on the GPU for reference encoding "
+                "(model.vae.cpu_offload is not supported with DCAE-V)"
+            )
+        started = time.perf_counter()
+        pixels = self._load_reference_frames(
+            image_path, height=height, width=width, frames=frames,
+        ).to(device=encoder_device, dtype=encoder_dtype)
+        with torch.no_grad():
+            latent = encoder.encode(pixels).latent_dist.mode()
+        if latent.ndim != 5 or latent.shape[2:] != (frames // t_ratio, latent_h, latent_w):
+            raise RuntimeError(
+                f"unexpected reference latent shape {tuple(latent.shape)}; expected "
+                f"[1, C, {frames // t_ratio}, {latent_h}, {latent_w}]"
+            )
+        if not encode_full_clip and latent_frames > 1:
+            latent = latent.expand(-1, -1, latent_frames, -1, -1).contiguous()
+        latent = latent.to(dtype=self.target_dtype, device=self.device)
+        del pixels
+        if owned:
+            del encoder
+            torch.cuda.empty_cache()
+        logger.info(
+            f"Reference image encoded: {image_path} -> latent {tuple(latent.shape)} "
+            f"({'full clip' if encode_full_clip else 'single chunk repeated'}, "
+            f"{time.perf_counter() - started:.2f}s)"
+        )
+        return latent
+
     def _prepare_vae_decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """Apply the shared VAE scaling and dtype conversion."""
         if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:

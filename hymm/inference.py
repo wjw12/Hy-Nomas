@@ -122,6 +122,10 @@ _BENCH_META_TOP_LEVEL_KEYS: Tuple[str, ...] = (
     "camera_trajectory_spec",
     "joint_control_spec",
     "evaluation_criteria",
+    # reference-image KV seeding (never part of the text prompt)
+    "reference_image",
+    "reference_prompt",
+    "reference_latent_frames",
 )
 
 # Per-event bench keys (joint bench; absent in camera / multiprompt benches).
@@ -1237,6 +1241,19 @@ def _load_from_json(
             else:
                 entry_meta["camera_trajectory"] = str(npz_path)
 
+        # Per-entry reference image for KV-cache seeding; relative paths are
+        # resolved against the directory of the prompt JSON.
+        reference_image = item.get("reference_image")
+        if reference_image:
+            reference_path = Path(str(reference_image)).expanduser()
+            if not reference_path.is_absolute():
+                reference_path = (json_path.parent / reference_path).resolve()
+            if not reference_path.is_file():
+                raise FileNotFoundError(
+                    f"[{test_id}] reference_image does not exist: {reference_path}"
+                )
+            entry_meta["reference_image"] = str(reference_path)
+
         if not desc_field_first and not desc_field_rest:
             raw_segments = item.get("segments", [])
             if max_segments is not None and len(raw_segments) > max_segments:
@@ -2144,6 +2161,32 @@ def main():
                 f"(overriding global {global_camera_trajectory!r})"
             )
 
+        # ---- Reference image (KV-cache seeding) ----
+        inference_cfg = args.inference
+        effective_reference_image = (
+            (entry_meta or {}).get("reference_image")
+            or getattr(inference_cfg, "reference_image", None)
+        )
+        effective_reference_prompt = (
+            (entry_meta or {}).get("reference_prompt")
+            or getattr(inference_cfg, "reference_prompt", None)
+        )
+        effective_reference_frames = int(
+            (entry_meta or {}).get("reference_latent_frames")
+            or getattr(inference_cfg, "reference_latent_frames", 4)
+            or 4
+        )
+        if effective_reference_image:
+            if rollout_type == "one_shot":
+                raise ValueError(
+                    "reference_image seeding requires rollout_type seg_ar or chunk_ar"
+                )
+            logger.info(
+                f"  Reference image: {effective_reference_image} "
+                f"({effective_reference_frames} latent frames, "
+                f"prompt={'custom' if effective_reference_prompt else 'derived from segment 0'})"
+            )
+
         # ---- Per-segment text drop & camera-off (joint bench: segments_meta) ----
         # Triggers (only fire when entry_meta carries the relevant keys; benches
         # without segments_meta keep the legacy "all-on" behaviour):
@@ -2237,6 +2280,9 @@ def main():
                     segment_has_camera=segment_has_camera,
                     cfg_schedule=getattr(args.inference, "cfg_schedule", None),
                     cfg_skip_steps=getattr(args.inference, "cfg_skip_steps", 0),
+                    reference_image=effective_reference_image,
+                    reference_prompt=effective_reference_prompt,
+                    reference_latent_frames=effective_reference_frames,
                 )
 
             with stage("output_to_cpu"):

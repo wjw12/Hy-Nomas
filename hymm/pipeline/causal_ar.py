@@ -664,6 +664,88 @@ class CPTCausalInferencePipeline(BasePipeline):
                 f"({self.kv_cache.slots} GPU staging slots sized per forward)"
             )
 
+    def _seed_reference_history(
+        self,
+        *,
+        reference_latent: torch.Tensor,
+        reference_enc: dict,
+        batch_size: int,
+        tokens_per_frame: int,
+        generator: torch.Generator,
+    ):
+        """Write a static reference clip into the empty KV history as "segment 0".
+
+        Mirrors the per-segment cache write: the clean reference latent is
+        re-noised to ``cache_noise_sigma`` (or written clean when the sigma is
+        0), paired with the reference prompt, and pushed through one
+        ``update_cache=True`` forward with ``cache_valid_len=0`` and
+        ``global_frame_counter=0``. Afterwards ``cache_valid_len`` /
+        ``global_frame_counter`` advance so segment 0 is generated as a
+        continuation of the reference, exactly like segment 1 follows segment 0.
+        Returns the cached video token range ``(start, end)``.
+        """
+        if self.cache_valid_len != 0 or self.global_frame_counter != 0:
+            raise RuntimeError("reference seeding requires an empty KV history")
+        if reference_enc is None:
+            raise RuntimeError("reference seeding requires the encoded reference prompt")
+        latent_frames = int(reference_latent.shape[2])
+        started = time.time()
+        cache_latents = reference_latent.to(device=self.device, dtype=self.target_dtype)
+        cache_t = torch.zeros([batch_size], device=self.device, dtype=torch.long)
+        if self.cache_noise_sigma > 0.0:
+            cache_eps = torch.randn(
+                cache_latents.shape, generator=generator, dtype=cache_latents.dtype,
+            ).to(device=cache_latents.device)
+            sigma = self.cache_noise_sigma
+            cache_latents = (
+                (1.0 - sigma) * cache_latents.float() + sigma * cache_eps.float()
+            ).to(cache_latents.dtype)
+            cache_t = torch.full(
+                [batch_size], sigma * 1000.0, device=self.device, dtype=torch.float32,
+            )
+        if cache_latents.shape[1] < self.in_channels:
+            pad = torch.zeros(
+                [cache_latents.shape[0], self.in_channels - cache_latents.shape[1],
+                 *cache_latents.shape[2:]],
+                device=cache_latents.device, dtype=cache_latents.dtype,
+            )
+            cache_latents = torch.cat([cache_latents, pad], dim=1)
+        text_states = reference_enc["text_states"]
+        text_mask = reference_enc["text_mask"]
+        extra_tokens = latent_frames * int(tokens_per_frame) + int(text_states.shape[1])
+        with stage("cache_write"), torch.autocast(device_type="cuda", dtype=self.target_dtype), \
+                self._kv_forward(update=True, extra_tokens=extra_tokens):
+            _, new_tokens = self.transformer.forward_with_cache(
+                hidden_states=cache_latents,
+                timestep=cache_t,
+                text_states=text_states,
+                text_mask=text_mask,
+                kv_cache_list=self.kv_cache,
+                cache_valid_len=0,
+                update_cache=True,
+                global_frame_counter=0,
+                cache_txt=True,
+                cache_mask_list=self.cache_mask_list,
+                camera_embedding=None,
+                camera_has_mask=None,
+                intra_seg_txt_offsets=None,
+                intra_seg_vid_windows=None,
+                camera_rope_time_offset=0,
+            )
+        new_tokens = int(new_tokens)
+        video_tokens = latent_frames * int(tokens_per_frame)
+        video_range = (0, video_tokens)
+        self.cache_valid_len += new_tokens
+        self.segment_token_lengths.append(new_tokens)
+        self.global_frame_counter += latent_frames
+        torch.cuda.synchronize()
+        logger.info(
+            f"Reference history seeded: {latent_frames} latent frames, "
+            f"+{new_tokens} cache tokens ({video_tokens} video + {new_tokens - video_tokens} text), "
+            f"sigma={self.cache_noise_sigma:.6f}, {time.time() - started:.2f}s"
+        )
+        return video_range
+
     @contextmanager
     def _kv_forward(self, *, update: bool, extra_tokens: int = 0):
         """Bracket one DiT forward for a host-staged KV cache (no-op otherwise)."""
@@ -1504,8 +1586,15 @@ class CPTCausalInferencePipeline(BasePipeline):
         preserve_kv_cache: bool = False,
         trajectory_translation_scale: Optional[float] = None,
         trajectory_rotation_scale: Optional[float] = None,
+        reference_image: Optional[str] = None,
+        reference_prompt: Optional[str] = None,
+        reference_latent_frames: int = 4,
     ):
-        """Run autoregressive inference on a list of prompts."""
+        """Run autoregressive inference on a list of prompts.
+
+        ``reference_image`` seeds the KV history with a static clip made from a
+        still image (see ``_seed_reference_history``) before segment 0.
+        """
         return self._process_single_prompt(
             prompts=prompts,
             num_frames=num_frames,
@@ -1526,6 +1615,9 @@ class CPTCausalInferencePipeline(BasePipeline):
             cfg_skip_steps=cfg_skip_steps,
             segment_callback=segment_callback,
             preserve_kv_cache=preserve_kv_cache,
+            reference_image=reference_image,
+            reference_prompt=reference_prompt,
+            reference_latent_frames=reference_latent_frames,
         )
 
     @torch.no_grad()
@@ -1552,9 +1644,20 @@ class CPTCausalInferencePipeline(BasePipeline):
         preserve_kv_cache: bool = False,
         trajectory_translation_scale: Optional[float] = None,
         trajectory_rotation_scale: Optional[float] = None,
+        reference_image: Optional[str] = None,
+        reference_prompt: Optional[str] = None,
+        reference_latent_frames: int = 4,
     ) -> torch.Tensor:
         """Generate video autoregressively, chunk-by-chunk within each segment."""
         self.transformer.sparse_optim_counts.clear()
+        reference_frames = int(reference_latent_frames) if reference_image else 0
+        if reference_image:
+            if reference_frames <= 0:
+                raise ValueError("reference_latent_frames must be positive")
+            if preserve_kv_cache:
+                raise ValueError("reference_image seeding is an offline (non-interactive) feature")
+            if getattr(self, "qvg_kv_storage", False):
+                raise ValueError("reference_image seeding does not support QVG KV storage")
         if segment_frame_boundaries is not None and len(segment_frame_boundaries) >= 2:
             num_segments = len(segment_frame_boundaries) - 1
         else:
@@ -1896,6 +1999,10 @@ class CPTCausalInferencePipeline(BasePipeline):
             max_cache_tokens = (
                 total_chunks * max_img_tokens_per_chunk + num_segments * text_len
             )
+        # The reference clip is one extra cached segment ahead of segment 0
+        # (with max_cache_segments it also counts as the oldest evictable one).
+        reference_tokens = reference_frames * tokens_per_frame + text_len if reference_frames else 0
+        max_cache_tokens += reference_tokens
         request_cache_tokens = max_cache_tokens
         max_cache_tokens += max_img_tokens_per_chunk + text_len
         if preserve_kv_cache:
@@ -2158,9 +2265,40 @@ class CPTCausalInferencePipeline(BasePipeline):
                 f"{cross_segment_text_head_only}, action_start={a_start}, "
                 f"intra_seg={'on' if offs is not None else 'off'}): {prompt[:80]}..."
             )
+        reference_enc = None
+        if reference_frames:
+            if swa_enabled:
+                raise ValueError("reference_image seeding does not support inference.sliding_window")
+            fps_value = float(getattr(self.args.inference, "video_fps", None) or getattr(self.args, "video_fps", 24))
+            reference_seconds = reference_frames * int(self.t_ratio or 4) / fps_value
+            reference_prompt_text = self._default_reference_prompt(
+                prompts[0], reference_seconds, caption=reference_prompt,
+            )
+            # Conditional branch only: the reference is written once into the
+            # canonical history, never evaluated under guidance.
+            reference_enc = self._encode_prompt(
+                reference_prompt_text, negative_prompt=negative_prompt, encode_negative=False,
+            )
+            logger.info(f"  [ref] Encoded reference prompt: {reference_prompt_text[:120]}...")
         text_encode_phase.__exit__(None, None, None)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # Reference image -> DCAE-V latent while neither text encoder nor DiT
+        # is resident (the encoder's activations are the only GPU peak here).
+        reference_latent = None
+        if reference_frames:
+            reference_latent = self._encode_reference_image_latent(
+                reference_image,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                latent_frames=reference_frames,
+                encode_full_clip=bool(
+                    getattr(self.args.inference, "reference_encode_full_clip", False)
+                ),
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Text encoder is off the GPU: allocate (or continue) the persistent KV
         # history now, right before the DiT phase.
@@ -2240,6 +2378,20 @@ class CPTCausalInferencePipeline(BasePipeline):
 
             _seg_profiler.set_total_steps(num_inference_steps)
             _seg_profiler._profiling_active = False
+
+            if reference_latent is not None and not continuing_session:
+                reference_video_range = self._seed_reference_history(
+                    reference_latent=reference_latent,
+                    reference_enc=reference_enc,
+                    batch_size=batch_size,
+                    tokens_per_frame=tokens_per_frame,
+                    generator=generator,
+                )
+                if prev_seg_last_frame and reference_video_range is not None:
+                    # The reference behaves like any previous segment: later
+                    # segments see only its final latent frame under this flag.
+                    cached_seg_video_ranges.append((-1, *reference_video_range))
+            reference_latent = None
 
             segments_with_cached_txt = set()
             segment_cache_start = self.cache_valid_len
