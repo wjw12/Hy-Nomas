@@ -30,14 +30,101 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import time
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import weakref
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+from loguru import logger
 
 from hymm.utils.inference_metrics import stage
 
 _ALIGN = 256  # byte alignment of every tensor inside a flat unit buffer
+_PAGE = 4096  # host page size; registered ranges never share a page
+
+
+# ---------------------------------------------------------------------------
+# Exact-size pinned host memory
+# ---------------------------------------------------------------------------
+def _cuda_error_code(result) -> int:
+    value = getattr(result, "value", result)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0 if result is None else 1
+
+
+def _unregister_host(ptr: int, storage_keepalive) -> None:
+    """Finalizer: unpin a registered range once its owning tensor is dropped.
+
+    ``storage_keepalive`` (the untyped storage, not the tensor) keeps the
+    memory allocated until the range has been unregistered.
+    """
+    try:
+        if torch.cuda.is_initialized():
+            # A non_blocking copy may still be reading the range.
+            torch.cuda.synchronize()
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+    except Exception:  # noqa: BLE001 - interpreter shutdown / driver teardown
+        pass
+    del storage_keepalive
+
+
+def allocate_pinned_exact(
+    shape: Union[int, Sequence[int]],
+    dtype: torch.dtype = torch.uint8,
+    *,
+    pin_memory: bool = True,
+) -> Tuple[torch.Tensor, bool]:
+    """Allocate an exact-size host tensor and page-lock it in place.
+
+    ``torch.empty(..., pin_memory=True)`` goes through PyTorch's caching host
+    allocator, which rounds every block up to the next power of two (a 311 MB
+    DiT unit costs 512 MiB, a 567 MB KV layer 1 GiB). Here the memory is a
+    pageable allocation of the requested size (plus at most two pages for
+    alignment) registered with ``cudaHostRegister``; a finalizer unregisters
+    it when the returned tensor is dropped. Registered memory reports
+    ``is_pinned() == True`` and makes ``non_blocking`` copies asynchronous.
+
+    Falls back to ``pin_memory=True`` and then to pageable memory (with a
+    warning) if registration fails. Without CUDA the result is pageable and
+    nothing is logged. Returns ``(tensor, pinned)``.
+    """
+    shape = [int(shape)] if isinstance(shape, int) else [int(s) for s in shape]
+    numel = 1
+    for size in shape:
+        numel *= size
+    nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    if not pin_memory or nbytes == 0 or not torch.cuda.is_available():
+        return torch.empty(shape, dtype=dtype, device="cpu"), False
+
+    padded = (nbytes + _PAGE - 1) // _PAGE * _PAGE
+    try:
+        base = torch.empty(padded + _PAGE, dtype=torch.uint8, device="cpu")
+        offset = (-base.data_ptr()) % _PAGE
+        region = base[offset : offset + padded]
+        ptr = region.data_ptr()
+        error = _cuda_error_code(torch.cuda.cudart().cudaHostRegister(ptr, padded, 0))
+        if error == 0:
+            tensor = region[:nbytes].view(dtype).view(shape)
+            finalizer = weakref.finalize(tensor, _unregister_host, ptr, region.untyped_storage())
+            # Process exit releases the pages anyway; do not call into a CUDA
+            # context that may already be torn down.
+            finalizer.atexit = False
+            return tensor, True
+        logger.warning(f"cudaHostRegister({padded} bytes) failed with error {error}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"cudaHostRegister({padded} bytes) failed: {exc}")
+    try:
+        tensor = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        logger.warning(
+            "Falling back to torch pin_memory=True; the caching host allocator "
+            f"rounds {nbytes} bytes up to the next power of two"
+        )
+        return tensor, True
+    except RuntimeError as exc:
+        logger.warning(f"Pinned host allocation failed ({exc}); using pageable memory")
+    return torch.empty(shape, dtype=dtype, device="cpu"), False
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +161,11 @@ class RingScheduler:
     @property
     def prefetch_depth(self) -> int:
         return min(self.slots - 1, len(self.sequence))
+
+    @property
+    def all_fit(self) -> bool:
+        """Every streamed unit owns a slot; nothing is released or prefetched."""
+        return len(self.sequence) <= self.slots - 1
 
     def initial_prefetch(self) -> List[Tuple[int, int]]:
         """``(unit, slot)`` pairs to load before the first forward."""
@@ -176,16 +268,9 @@ class _Packed:
         The original per-tensor CPU storage is released once no reference to
         it remains, so the transient cost is one flat buffer, not two models.
         """
-        host = None
-        if pin_memory and self.nbytes:
-            try:
-                host = torch.empty(self.nbytes, dtype=torch.uint8, pin_memory=True)
-                self.pinned = True
-            except RuntimeError:
-                host = None
-        if host is None:
-            host = torch.empty(self.nbytes, dtype=torch.uint8)
-            self.pinned = False
+        host, self.pinned = allocate_pinned_exact(
+            self.nbytes, torch.uint8, pin_memory=pin_memory,
+        )
         for tensor, offset, nbytes in self.entries:
             view = host[offset : offset + nbytes].view(tensor.dtype).view(tensor.shape)
             view.copy_(tensor.detach().to("cpu"))
@@ -282,10 +367,27 @@ class ModuleStreamer:
 
         unit_modules = [m for group in units for m in group]
         unit_tensors = [all_tensors(group) for group in units]
+        # Rebinding .data of a tensor shared by two units (or by a unit and the
+        # resident set) would silently point one of them at the other's slot,
+        # so sharing is rejected instead of deduplicated.
+        owner: Dict[int, int] = {}
+        for unit_index, group in enumerate(unit_tensors):
+            for tensor in group:
+                previous = owner.setdefault(id(tensor), unit_index)
+                if previous != unit_index:
+                    raise ValueError(
+                        f"Module streaming: units {previous} and {unit_index} share a tensor "
+                        f"of shape {tuple(tensor.shape)}; streamed units must not share weights"
+                    )
         resident_tensors: List[torch.Tensor] = []
-        seen = {id(t) for group in unit_tensors for t in group}
+        seen = set()
         for module in resident:
             for tensor in direct_tensors(module):
+                if id(tensor) in owner:
+                    raise ValueError(
+                        f"Module streaming: resident module {type(module).__name__} shares a "
+                        f"tensor with streamed unit {owner[id(tensor)]}"
+                    )
                 if id(tensor) not in seen:
                     seen.add(id(tensor))
                     resident_tensors.append(tensor)
@@ -352,7 +454,21 @@ class ModuleStreamer:
         if self.depth > 0:
             self.depth += 1
             return
+        try:
+            self._enter_phase()
+        except BaseException:
+            # An OOM (or any error) part-way through must not leave a
+            # half-bound model or a depth that never returns to zero: rebind
+            # everything to the host copies and drop the device buffers.
+            self.depth = 1
+            try:
+                self.exit()
+            except BaseException:  # noqa: BLE001 - keep the original error
+                pass
+            raise
         self.depth = 1
+
+    def _enter_phase(self) -> None:
         started = time.perf_counter()
         with stage(self.stage_prefix + "_H2D"), torch.inference_mode(False), torch.no_grad():
             self._copy_stream = torch.cuda.Stream(device=self.device)
@@ -399,7 +515,7 @@ class ModuleStreamer:
         try:
             torch.cuda.synchronize(self.device)
         finally:
-            with stage(self.stage_prefix + "_D2H"):
+            with stage(self.stage_prefix + "_D2H"), torch.inference_mode(False), torch.no_grad():
                 for packed in self.packed:
                     packed.bind_host()
                 if self.resident_packed is not None:
@@ -476,7 +592,9 @@ class ModuleStreamer:
             return  # resident for this phase
         compute = torch.cuda.current_stream(self.device)
         slot, released, prefetch, in_order = self.scheduler.arrive(unit)
-        if not in_order or self._slot_occupant[slot] != unit:
+        # When every unit owns its slot, order does not matter: only the
+        # occupant decides whether a reload is needed.
+        if (not in_order and not self.scheduler.all_fit) or self._slot_occupant[slot] != unit:
             # A unit was skipped or repeated (exception mid-forward, partial
             # forward, a model path that visits blocks differently). Drain the
             # copy stream and restart the ring from here.

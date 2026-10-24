@@ -13,7 +13,7 @@ import time
 import torch
 from hymm.utils.inference_metrics import stage
 
-from configs.cpu_offload import enabled_cpu_offloads
+from configs.cpu_offload import STREAMING_OFFLOAD_NAMES, enabled_cpu_offloads
 
 
 def _frozen_model_device(module):
@@ -176,10 +176,16 @@ def offload_dit_for_decode(method):
 
 def validate_model_cpu_offload(args, device):
     """Validate before checkpoint loading, including actual execution topology."""
-    if not enabled_cpu_offloads(args):
+    enabled = enabled_cpu_offloads(args)
+    if not enabled:
         return
     if torch.device(device).type != "cuda":
         raise ValueError("P2 CPU offload requires a CUDA execution device")
+    if all(name in STREAMING_OFFLOAD_NAMES for name in enabled):
+        # Layer streaming is per process (sp_size=1 is enforced separately),
+        # so data-parallel prompt sharding (torchrun N ranks, sp_size=1) is
+        # fine. Note that each DP rank pins its own ~45 GB copy of the weights.
+        return
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         world_size = torch.distributed.get_world_size()

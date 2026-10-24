@@ -522,11 +522,17 @@ inference:
   reference_image: null            # path to a PNG/JPEG, or null
   reference_prompt: null           # JSON segment prompt or plain caption; null derives one from segment 0
   reference_latent_frames: 4       # latent frames of the static reference clip (4 = 16 pixel frames)
-  # false: encode one 4-frame chunk and repeat its latent (cheap, ~3 GB peak);
-  # true: encode all 4*reference_latent_frames frames at once (temporal context, higher peak).
+  # false: encode 4 pixel frames (one latent frame) and repeat the latent. The
+  #   DCAE-V causal chunk is 40 pixel frames, so this is a boundary-padded
+  #   chunk (an approximation). Single-chunk GPU peak ~6.5 GiB (weights +
+  #   activations at 720p with the encoder-only load).
+  # true: encode all 4*reference_latent_frames frames at once (real temporal
+  #   context; ~11 GiB peak for reference_latent_frames=4 with the encoder-only
+  #   load). Set it when GPU memory allows.
   reference_encode_full_clip: false
   # DCAE-V checkpoint (dc-ae-v-1.0-f32t4c32-bf16.pt) for the encoder. Required
-  # when model.vae.name=pixelumm, since PixelUMM is decoder-only.
+  # when model.vae.name=pixelumm, since PixelUMM is decoder-only. Only the
+  # encoder.* weights are loaded (memory-mapped), then freed after encoding.
   reference_vae_checkpoint: null
   # Camera pose normalization at inference. Mirror whatever the training run
   # used (dataset.normalize_* in the training yaml). Leaving these null

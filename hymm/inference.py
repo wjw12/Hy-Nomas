@@ -2171,12 +2171,28 @@ def main():
             (entry_meta or {}).get("reference_prompt")
             or getattr(inference_cfg, "reference_prompt", None)
         )
-        effective_reference_frames = int(
-            (entry_meta or {}).get("reference_latent_frames")
-            or getattr(inference_cfg, "reference_latent_frames", 4)
-            or 4
-        )
+        if isinstance(effective_reference_prompt, (dict, list)):
+            # A structured JSON prompt given inline in the prompt file.
+            effective_reference_prompt = json.dumps(effective_reference_prompt, ensure_ascii=False)
+        effective_reference_frames = 4
         if effective_reference_image:
+            raw_frames = (entry_meta or {}).get("reference_latent_frames")
+            if raw_frames is None:
+                raw_frames = getattr(inference_cfg, "reference_latent_frames", None)
+            if raw_frames is not None:
+                try:
+                    parsed_frames = float(str(raw_frames).strip())
+                except ValueError:
+                    parsed_frames = float("nan")
+                if not parsed_frames.is_integer():
+                    raise ValueError(
+                        f"reference_latent_frames must be a positive integer, got {raw_frames!r}"
+                    )
+                effective_reference_frames = int(parsed_frames)
+            if effective_reference_frames <= 0:
+                raise ValueError(
+                    f"reference_latent_frames must be a positive integer, got {raw_frames!r}"
+                )
             if rollout_type == "one_shot":
                 raise ValueError(
                     "reference_image seeding requires rollout_type seg_ar or chunk_ar"

@@ -22,6 +22,13 @@ forwards, 0 otherwise), prefetches the first layers, and keeps already
 prefetched layers when consecutive forwards share the same geometry (the
 eight denoise steps of a segment). On update forwards, each layer's newly
 written range is copied back to the host before its slot is reused.
+
+Slot reuse is ordered by CUDA events: a slot is only refilled on the copy
+stream after the compute stream has finished every kernel that reads it,
+including across forwards (``end_forward`` records the "slot free" event of
+the layers still bound when the forward ends). A layer's dict is reset to an
+empty placeholder as soon as its slot is released, so no dict ever holds a
+view into a slot that another layer may own.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from hymm.utils.module_streaming import RingScheduler
+from hymm.utils.module_streaming import RingScheduler, allocate_pinned_exact
 
 
 class HostStagedKVCache(list):
@@ -65,12 +72,8 @@ class HostStagedKVCache(list):
             {"k": self._host_empty(self.capacity), "v": self._host_empty(self.capacity)}
             for _ in range(self.num_blocks)
         ]
-        self._placeholder = {
-            "k": torch.empty([self.batch_size, 0, self.cache_heads, self.head_dim],
-                             dtype=dtype, device=self.device),
-            "v": torch.empty([self.batch_size, 0, self.cache_heads, self.head_dim],
-                             dtype=dtype, device=self.device),
-        }
+        empty_shape = [self.batch_size, 0, self.cache_heads, self.head_dim]
+        self._placeholder = {"k": self._device_empty(empty_shape), "v": self._device_empty(empty_shape)}
         super().__init__(
             [{"k": self._placeholder["k"], "v": self._placeholder["v"]} for _ in range(self.num_blocks)]
         )
@@ -93,18 +96,20 @@ class HostStagedKVCache(list):
         self.bytes_d2h = 0
         self.resyncs = 0
         self.forwards = 0
+        self.peak_staging_bytes = 0
 
     # ------------------------------------------------------------------
     # allocation helpers
     # ------------------------------------------------------------------
     def _host_empty(self, tokens: int) -> torch.Tensor:
         shape = [self.batch_size, int(tokens), self.cache_heads, self.head_dim]
-        if self._pin_memory:
-            try:
-                return torch.empty(shape, dtype=self.dtype, device="cpu", pin_memory=True)
-            except RuntimeError:
-                self._pin_memory = False
-        return torch.empty(shape, dtype=self.dtype, device="cpu")
+        tensor, pinned = allocate_pinned_exact(shape, self.dtype, pin_memory=self._pin_memory)
+        # Copies use non_blocking only while every host tensor is pinned.
+        self._pin_memory = self._pin_memory and pinned
+        return tensor
+
+    def _device_empty(self, shape) -> torch.Tensor:
+        return torch.empty(shape, dtype=self.dtype, device=self.device)
 
     @property
     def pin_memory_enabled(self) -> bool:
@@ -116,25 +121,37 @@ class HostStagedKVCache(list):
     def staging_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for slot in self._staging for t in slot.values())
 
+    def _unbind(self, layer: int) -> None:
+        entry = list.__getitem__(self, layer)
+        entry["k"] = self._placeholder["k"]
+        entry["v"] = self._placeholder["v"]
+
+    def _unbind_entries(self) -> None:
+        """Point every layer dict back at the empty placeholder.
+
+        Drops the last references to staging views so the staging memory is
+        really released when the slots are freed or regrown.
+        """
+        for layer in range(self.num_blocks):
+            self._unbind(layer)
+
     def _ensure_staging(self, needed: int) -> None:
         if needed <= self._staging_capacity and self._staging:
             return
         self._drain()
+        self._unbind_entries()
         self._staging = []
         torch.cuda.empty_cache()
         with torch.inference_mode(False), torch.no_grad():
+            shape = [self.batch_size, needed, self.cache_heads, self.head_dim]
             self._staging = [
-                {
-                    "k": torch.empty([self.batch_size, needed, self.cache_heads, self.head_dim],
-                                     dtype=self.dtype, device=self.device),
-                    "v": torch.empty([self.batch_size, needed, self.cache_heads, self.head_dim],
-                                     dtype=self.dtype, device=self.device),
-                }
+                {"k": self._device_empty(shape), "v": self._device_empty(shape)}
                 for _ in range(self.slots)
             ]
         self._staging_capacity = needed
         self._slot_layer = [None] * self.slots
         self._ring_valid_for = None
+        self.peak_staging_bytes = max(self.peak_staging_bytes, self.staging_bytes())
 
     def _drain(self) -> None:
         self._copy_stream.synchronize()
@@ -181,16 +198,26 @@ class HostStagedKVCache(list):
             return
         compute = torch.cuda.current_stream(self.device)
         if self._forward_update:
-            # Write back the last layer and make the host copy visible to the
-            # pipeline before it reads or grows the host tensors.
-            for layer, slot in list(self._bound_slot.items()):
+            # Write back the layers still bound and make the host copy visible
+            # to the pipeline before it reads or grows the host tensors.
+            if self._bound_slot:
                 event = torch.cuda.Event()
                 event.record(compute)
                 with torch.cuda.stream(self._copy_stream):
                     self._copy_stream.wait_event(event)
-                    self._writeback(layer, slot)
+                    for layer, slot in list(self._bound_slot.items()):
+                        self._writeback(layer, slot)
             self._copy_stream.synchronize()
             self._ring_valid_for = None  # history changed; next forward reloads
+        else:
+            # The next forward may reuse the ring without draining: its
+            # prefetch into the slots still bound here must wait until this
+            # forward's attention kernels have finished reading them.
+            for slot in set(self._bound_slot.values()):
+                event = torch.cuda.Event()
+                event.record(compute)
+                self._free[slot] = event
+        self._unbind_entries()
         self._bound_slot = {}
         self._in_forward = False
 
@@ -222,6 +249,25 @@ class HostStagedKVCache(list):
             )
         self.bytes_d2h += 2 * (end - start) * self.batch_size * self.cache_heads * self.head_dim * 2
 
+    def _resync(self, layer: int, compute) -> None:
+        """Restart the ring at ``layer`` after an out-of-order arrival."""
+        self.resyncs += 1
+        if self._forward_update and self._bound_slot:
+            # Layers computed in this update forward still hold their newly
+            # written range only in staging; save it before the drain forgets
+            # the bindings and the slots are refilled.
+            event = torch.cuda.Event()
+            event.record(compute)
+            with torch.cuda.stream(self._copy_stream):
+                self._copy_stream.wait_event(event)
+                for bound_layer, bound_slot in list(self._bound_slot.items()):
+                    self._writeback(bound_layer, bound_slot)
+        for bound_layer in list(self._bound_slot):
+            self._unbind(bound_layer)
+        self._drain()
+        for load_layer, load_slot in self.scheduler.resync_prefetch(layer):
+            self._issue_load(load_layer, load_slot, self._forward_valid)
+
     def __getitem__(self, index):  # type: ignore[override]
         if isinstance(index, slice) or not self._in_forward:
             return list.__getitem__(self, index)
@@ -229,14 +275,16 @@ class HostStagedKVCache(list):
         if layer < 0:
             layer += self.num_blocks
         if layer in self._served:
+            # Re-reading a layer in the same forward. While it is bound the
+            # dict holds its staging views; once its slot was released the dict
+            # was reset to the empty placeholder, so a late read (for example
+            # the DiT's ``"swa_capacity" in kv_cache_list[0]`` key check after
+            # the block loop) can never see another layer's slot.
             return list.__getitem__(self, layer)
         compute = torch.cuda.current_stream(self.device)
         slot, released, prefetch, in_order = self.scheduler.arrive(layer)
-        if not in_order or self._slot_layer[slot] != layer:
-            self.resyncs += 1
-            self._drain()
-            for load_layer, load_slot in self.scheduler.resync_prefetch(layer):
-                self._issue_load(load_layer, load_slot, self._forward_valid)
+        if (not in_order and not self.scheduler.all_fit) or self._slot_layer[slot] != layer:
+            self._resync(layer, compute)
             slot, released, prefetch, _ = self.scheduler.arrive(layer)
         ready = self._ready.get(layer)
         if ready is not None:
@@ -250,6 +298,7 @@ class HostStagedKVCache(list):
         if released is not None and released != layer:
             released_slot = self._bound_slot.pop(released, None)
             if released_slot is not None:
+                self._unbind(released)
                 event = torch.cuda.Event()
                 event.record(compute)
                 if self._forward_update:
@@ -263,7 +312,12 @@ class HostStagedKVCache(list):
                     self._free[released_slot] = event
         if prefetch is not None:
             prefetch_layer, prefetch_slot = prefetch
-            if self._slot_layer[prefetch_slot] != prefetch_layer:
+            wraps = self.scheduler.position_of[prefetch_layer] <= self.scheduler.position_of[layer]
+            if self._forward_update and wraps:
+                # The next forward after an update always reloads (the history
+                # changed), so a wrap-around prefetch would only be discarded.
+                pass
+            elif self._slot_layer[prefetch_slot] != prefetch_layer:
                 self._issue_load(prefetch_layer, prefetch_slot, self._forward_valid)
         return entry
 
@@ -310,8 +364,10 @@ class HostStagedKVCache(list):
     def release_staging(self) -> None:
         """Free GPU staging between phases (for example before VAE decode)."""
         self._require_idle()
+        self._unbind_entries()
         self._staging = []
         self._staging_capacity = 0
+        self._slot_layer = [None] * self.slots
         torch.cuda.empty_cache()
 
     def snapshot(self) -> dict:
@@ -321,6 +377,7 @@ class HostStagedKVCache(list):
             "capacity_tokens": self.capacity,
             "host_bytes": self.host_bytes(),
             "staging_bytes": self.staging_bytes(),
+            "peak_staging_bytes": self.peak_staging_bytes,
             "staging_capacity_tokens": self._staging_capacity,
             "slots": self.slots,
             "layer_loads": self.layer_loads,

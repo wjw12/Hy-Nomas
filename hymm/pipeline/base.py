@@ -449,10 +449,15 @@ class BasePipeline(nn.Module):
     ) -> torch.Tensor:
         """Encode a still image into ``[1, 32, latent_frames, latent_h, latent_w]`` DCAE-V latents.
 
-        The image is treated as a static clip. By default one 4-frame chunk is
-        encoded (one latent frame) and repeated ``latent_frames`` times; with
-        ``encode_full_clip`` the whole ``4 * latent_frames``-frame clip goes
-        through the chunk-causal encoder in one pass (more GPU memory).
+        The image is treated as a static clip. By default 4 pixel frames are
+        encoded (one latent frame) and repeated ``latent_frames`` times. The
+        DCAE-V causal chunk is 40 pixel frames, so a 4-frame encode is a
+        boundary-padded chunk: an approximation of what the encoder produces
+        inside a real clip. With ``encode_full_clip`` the whole
+        ``4 * latent_frames``-frame clip goes through the chunk-causal encoder
+        in one pass; set ``inference.reference_encode_full_clip=true`` when GPU
+        memory allows. A separately loaded encoder (PixelUMM runs) is built
+        encoder-only and dropped afterwards.
         """
         from hymm.models.vae.autoencoder_dcae_v import AutoencoderDCAEV
 
@@ -471,8 +476,11 @@ class BasePipeline(nn.Module):
                     "inference.reference_vae_checkpoint to dc-ae-v-1.0-f32t4c32-bf16.pt "
                     "(PixelUMM is decoder-only)"
                 )
+            # Encoder only: no FP32 build of the full model on the host and no
+            # decoder weights on the GPU.
             encoder = AutoencoderDCAEV.from_checkpoint(
                 checkpoint_path=str(checkpoint), dtype=torch.bfloat16, device=self.device,
+                encoder_only=True,
             )
             encoder.eval().requires_grad_(False)
             owned = True

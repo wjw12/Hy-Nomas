@@ -23,10 +23,12 @@ def _load_cpu_pipeline():
     import math
     import os
     import time
+    from contextlib import contextmanager
     from typing import Callable, List, Optional
     from loguru import logger
     from omegaconf import ListConfig
     from hymm.distributed.parallel_states import nccl_info
+    from hymm.models.dit.modules.host_staged_kv_cache import HostStagedKVCache
     from hymm.utils.inference_metrics import stage
 
     source = (ROOT / "hymm/pipeline/causal_ar.py").read_text()
@@ -34,7 +36,8 @@ def _load_cpu_pipeline():
     tree.body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
     namespace = dict(torch=torch, math=math, os=os, time=time, logger=logger,
                      Callable=Callable, List=List, Optional=Optional, ListConfig=ListConfig,
-                     BasePipeline=nn.Module, nccl_info=nccl_info, stage=stage)
+                     BasePipeline=nn.Module, nccl_info=nccl_info, stage=stage,
+                     contextmanager=contextmanager, HostStagedKVCache=HostStagedKVCache)
     exec(compile(tree, "causal_ar.py", "exec"), namespace)
     return SimpleNamespace(**namespace)
 

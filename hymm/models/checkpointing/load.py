@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from safetensors.torch import load_file
+import torch
 
 from configs.constants import PROMPT_TEMPLATE
 from hymm.models.dit.modules import load_model
@@ -37,8 +38,9 @@ def load_hunyuan_state_dict(
 
     A base DiT may omit newly initialized camera modules. Other missing model
     parameters and tensor-shape mismatches indicate incompatible weights.
-    ``cast_to_model_dtype`` streams the file tensor by tensor and casts to the
-    model's parameter dtype on the way in, halving host RAM for FP32 files.
+    ``cast_to_model_dtype`` streams the file tensor by tensor and copies each
+    one straight into the model (casting to the parameter dtype), so host RAM
+    peaks at the model itself plus one tensor instead of a full state dict.
     """
     if convert_state_dict_in_out or convert_state_dict_16168_to_16164:
         raise ValueError(
@@ -56,31 +58,15 @@ def load_hunyuan_state_dict(
         return key.replace("_checkpoint_wrapped_module.", "")
 
     camera_pattern = re.compile(r"^double_blocks\.(\d+)\.action_module\.(.+)$")
-    remapped = {}
     if cast_to_model_dtype:
-        # Read tensor by tensor and cast each floating tensor to the model's
-        # dtype as it arrives, so an FP32 checkpoint costs one BF16 copy of host
-        # RAM instead of the full FP32 dict plus the model (34 GB + 17 GB for
-        # the 8.5B DiT). The values are identical to casting after load.
-        from safetensors import safe_open
-
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            for raw_key in handle.keys():
-                key = _normalize(raw_key)
-                if key in remapped:
-                    raise ValueError(f"Duplicate DiT key after normalization: {key}")
-                tensor = handle.get_tensor(raw_key)
-                target = expected.get(key)
-                if target is not None and tensor.is_floating_point() and tensor.dtype != target.dtype:
-                    tensor = tensor.to(dtype=target.dtype)
-                remapped[key] = tensor
-    else:
-        weights = load_file(str(path))
-        for raw_key, tensor in weights.items():
-            key = _normalize(raw_key)
-            if key in remapped:
-                raise ValueError(f"Duplicate DiT key after normalization: {key}")
-            remapped[key] = tensor
+        return _load_streamed_into_model(model, path, expected, _normalize, logger)
+    remapped = {}
+    weights = load_file(str(path))
+    for raw_key, tensor in weights.items():
+        key = _normalize(raw_key)
+        if key in remapped:
+            raise ValueError(f"Duplicate DiT key after normalization: {key}")
+        remapped[key] = tensor
     if not remapped:
         raise ValueError(f"DiT checkpoint contains no tensors: {path}")
 
@@ -112,6 +98,70 @@ def load_hunyuan_state_dict(
     if logger is not None:
         logger.info(
             f"Loaded {len(remapped)} DiT tensors from {path}; "
+            f"new camera tensors={sum(is_camera_param(k) for k in missing)}, "
+            f"unexpected keys ignored={len(unexpected)}"
+        )
+    return model
+
+
+def _load_streamed_into_model(model, path, expected, normalize, logger):
+    """``cast_to_model_dtype`` path of :func:`load_hunyuan_state_dict`.
+
+    Keys, shapes and missing parameters are validated from the safetensors
+    header before any data is read; then every tensor is read on its own and
+    copied (with dtype cast) into the model's existing storage. Host RAM peaks
+    at the BF16 model plus one checkpoint tensor (the dict-based path holds a
+    second full copy of the weights: the state dict, FP32 or BF16, plus the
+    model). Missing / unexpected key semantics match the dict-based path.
+    """
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        raw_by_key = {}
+        for raw_key in handle.keys():
+            key = normalize(raw_key)
+            if key in raw_by_key:
+                raise ValueError(f"Duplicate DiT key after normalization: {key}")
+            raw_by_key[key] = raw_key
+        if not raw_by_key:
+            raise ValueError(f"DiT checkpoint contains no tensors: {path}")
+        unexpected = sorted(set(raw_by_key) - set(expected))
+        for key in unexpected:
+            del raw_by_key[key]
+        mismatched = []
+        for key, raw_key in raw_by_key.items():
+            shape = tuple(handle.get_slice(raw_key).get_shape())
+            if shape != tuple(expected[key].shape):
+                mismatched.append((key, shape))
+        if mismatched:
+            detail = ", ".join(
+                f"{key}: {shape} vs {tuple(expected[key].shape)}" for key, shape in mismatched[:5]
+            )
+            raise ValueError(f"Incompatible DiT tensor shapes in {path}: {detail}")
+        missing = sorted(set(expected) - set(raw_by_key))
+        parameter_names = set(dict(model.named_parameters()))
+        missing_required = [
+            key for key in missing if key in parameter_names and not is_camera_param(key)
+        ]
+        if missing_required:
+            raise ValueError(
+                f"Missing {len(missing_required)} non-camera DiT parameters in {path}: "
+                f"{missing_required[:10]}"
+            )
+        with torch.no_grad():
+            for key, raw_key in raw_by_key.items():
+                tensor = handle.get_tensor(raw_key)
+                target = expected[key]
+                if tensor.shape != target.shape:
+                    raise ValueError(
+                        f"Incompatible DiT tensor shape in {path}: {key}: "
+                        f"{tuple(tensor.shape)} vs {tuple(target.shape)}"
+                    )
+                target.copy_(tensor)
+                del tensor
+    if logger is not None:
+        logger.info(
+            f"Loaded {len(raw_by_key)} DiT tensors from {path} (streamed into the model); "
             f"new camera tensors={sum(is_camera_param(k) for k in missing)}, "
             f"unexpected keys ignored={len(unexpected)}"
         )

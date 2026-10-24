@@ -1183,10 +1183,14 @@ class DCAEV(nn.Module):
 
     @property
     def spatial_compression_ratio(self) -> int:
+        if self.decoder is None:  # encoder-only build
+            return AutoencoderDCAEV.spatial_compression_ratio
         return self.decoder.spatial_compression_ratio
 
     @property
     def temporal_compression_ratio(self) -> int:
+        if self.decoder is None:  # encoder-only build
+            return AutoencoderDCAEV.time_compression_ratio
         return self.decoder.temporal_compression_ratio
 
     def _blend_t(
@@ -1256,6 +1260,8 @@ class DCAEV(nn.Module):
         return self.encoder(x)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
+        if self.decoder is None:
+            raise RuntimeError("this DCAE-V model was loaded with encoder_only=True")
         if self.cfg.decode_temporal_tile_size is not None:
             out = self.temporal_tiled_decode(z)
         else:
@@ -1660,14 +1666,35 @@ class AutoencoderDCAEV(nn.Module):
         *,
         dtype: torch.dtype = torch.bfloat16,
         device: str | torch.device = "cpu",
+        encoder_only: bool = False,
     ) -> "AutoencoderDCAEV":
-        """Instantiate from a ``dc-ae-v-1.0-f32t4c32-bf16.pt`` file."""
+        """Instantiate from a ``dc-ae-v-1.0-f32t4c32-bf16.pt`` file.
+
+        ``encoder_only`` builds the module skeleton on the meta device, drops
+        the decoder, memory-maps the checkpoint and assigns only the
+        ``encoder.*`` tensors, so neither an FP32 build of the full model nor
+        the decoder weights ever occupy host or GPU memory. ``decode`` is
+        unavailable on the result.
+        """
         device = torch.device(device) if isinstance(device, str) else device
 
         cfg = dc_ae_v_f32t4c32_config()
-        inner = DCAEV(cfg)
+        if encoder_only:
+            with torch.device("meta"):
+                inner = DCAEV(cfg)
+            inner.decoder = None
+        else:
+            inner = DCAEV(cfg)
 
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if encoder_only:
+            try:
+                ckpt = torch.load(
+                    checkpoint_path, map_location="cpu", weights_only=True, mmap=True,
+                )
+            except RuntimeError:  # legacy (non-zip) serialization cannot be mmapped
+                ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        else:
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         state_dict = ckpt.get("model_state_dict", ckpt)
 
         if "ema_model_state_dict" in ckpt:
@@ -1677,7 +1704,12 @@ class AutoencoderDCAEV(nn.Module):
             else:
                 state_dict = ema_sd
 
-        inner.load_state_dict(state_dict, strict=True)
+        if encoder_only:
+            encoder_state = get_submodule_weights(state_dict, "encoder.")
+            inner.encoder.load_state_dict(encoder_state, strict=True, assign=True)
+            del ckpt, state_dict
+        else:
+            inner.load_state_dict(state_dict, strict=True)
         inner = inner.to(dtype=dtype, device=device).eval()
 
         wrapper = cls(model=inner)

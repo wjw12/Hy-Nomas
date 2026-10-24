@@ -563,6 +563,13 @@ class CPTCausalInferencePipeline(BasePipeline):
                 )
             # Exact BF16 history in pinned host memory; each layer is staged into
             # a small GPU ring as the block loop reaches it (small-GPU path).
+            # Drop a previous request's cache (tens of GB pinned) first so the
+            # two never coexist.
+            self.kv_cache = None
+            self.cache_mask_list = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            staging_slots = getattr(self.args.inference, "kv_cache_host_staging_slots", None)
             self.kv_cache = HostStagedKVCache(
                 num_blocks=self.num_double_blocks,
                 batch_size=batch_size,
@@ -571,7 +578,7 @@ class CPTCausalInferencePipeline(BasePipeline):
                 head_dim=head_dim,
                 dtype=dtype,
                 device=device,
-                slots=int(getattr(self.args.inference, "kv_cache_host_staging_slots", 2) or 2),
+                slots=2 if staging_slots is None else int(staging_slots),
             )
             self.cache_mask_list = [
                 torch.zeros(
@@ -688,6 +695,32 @@ class CPTCausalInferencePipeline(BasePipeline):
             raise RuntimeError("reference seeding requires an empty KV history")
         if reference_enc is None:
             raise RuntimeError("reference seeding requires the encoded reference prompt")
+        out_channels = int(self.transformer.config.out_channels)
+        if reference_latent.ndim != 5 or int(reference_latent.shape[1]) != out_channels:
+            raise RuntimeError(
+                f"reference latent has shape {tuple(reference_latent.shape)}; expected "
+                f"[B, {out_channels}, T, H, W] (the DiT's latent channels)"
+            )
+        if self.max_cache_segments is not None:
+            logger.warning(
+                "max_cache_segments is set: the reference clip is the oldest cached "
+                "segment and is evicted first once the cache holds "
+                f"{self.max_cache_segments} segments"
+            )
+        if self.cache_at_step >= 0:
+            logger.info(
+                "cache_at_step is set: generated segments are cached from denoise step "
+                f"{self.cache_at_step}, but the reference clip is written clean (sigma=0)"
+            )
+        # The KV cache holds one slot per guidance branch unless the seg_ar
+        # single-slot CFG cache is on; give every branch the same conditional
+        # reference, as the canonical-history sync does for generated segments.
+        cache_batch = int(self.cache_mask_list[0].shape[0]) if self.cache_mask_list else batch_size
+        if cache_batch % batch_size != 0:
+            raise RuntimeError(
+                f"KV cache batch {cache_batch} is not a multiple of the request batch {batch_size}"
+            )
+        rep = cache_batch // batch_size
         latent_frames = int(reference_latent.shape[2])
         started = time.time()
         cache_latents = reference_latent.to(device=self.device, dtype=self.target_dtype)
@@ -712,6 +745,12 @@ class CPTCausalInferencePipeline(BasePipeline):
             cache_latents = torch.cat([cache_latents, pad], dim=1)
         text_states = reference_enc["text_states"]
         text_mask = reference_enc["text_mask"]
+        if rep > 1:
+            cache_latents = cache_latents.repeat(rep, 1, 1, 1, 1)
+            cache_t = cache_t.repeat(rep)
+            text_states = text_states.repeat(rep, *([1] * (text_states.ndim - 1)))
+            if text_mask is not None:
+                text_mask = text_mask.repeat(rep, *([1] * (text_mask.ndim - 1)))
         extra_tokens = latent_frames * int(tokens_per_frame) + int(text_states.shape[1])
         with stage("cache_write"), torch.autocast(device_type="cuda", dtype=self.target_dtype), \
                 self._kv_forward(update=True, extra_tokens=extra_tokens):
@@ -738,7 +777,8 @@ class CPTCausalInferencePipeline(BasePipeline):
         self.cache_valid_len += new_tokens
         self.segment_token_lengths.append(new_tokens)
         self.global_frame_counter += latent_frames
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         logger.info(
             f"Reference history seeded: {latent_frames} latent frames, "
             f"+{new_tokens} cache tokens ({video_tokens} video + {new_tokens - video_tokens} text), "
@@ -1651,6 +1691,12 @@ class CPTCausalInferencePipeline(BasePipeline):
         """Generate video autoregressively, chunk-by-chunk within each segment."""
         self.transformer.sparse_optim_counts.clear()
         reference_frames = int(reference_latent_frames) if reference_image else 0
+        inference_args = getattr(self.args, "inference", None)
+        if preserve_kv_cache and bool(getattr(inference_args, "kv_cache_host_staging", False)):
+            raise ValueError(
+                "inference.kv_cache_host_staging does not support preserve_kv_cache "
+                "(interactive continuation); disable one of them"
+            )
         if reference_image:
             if reference_frames <= 0:
                 raise ValueError("reference_latent_frames must be positive")
@@ -1658,6 +1704,10 @@ class CPTCausalInferencePipeline(BasePipeline):
                 raise ValueError("reference_image seeding is an offline (non-interactive) feature")
             if getattr(self, "qvg_kv_storage", False):
                 raise ValueError("reference_image seeding does not support QVG KV storage")
+            if bool(getattr(inference_args, "sliding_window", {}).get("enabled", False)):
+                raise ValueError("reference_image seeding does not support inference.sliding_window")
+            if not os.path.isfile(str(reference_image)):
+                raise FileNotFoundError(f"reference_image does not exist: {reference_image}")
         if segment_frame_boundaries is not None and len(segment_frame_boundaries) >= 2:
             num_segments = len(segment_frame_boundaries) - 1
         else:
@@ -1988,6 +2038,12 @@ class CPTCausalInferencePipeline(BasePipeline):
         session_segment_offset = (
             int(self._interactive_segment_count) if continuing_session else 0
         )
+        if not continuing_session:
+            # A fresh rollout starts at frame 0. _initialize_kv_cache resets
+            # these too, but it now runs after text encoding, and
+            # _fixed_initial_noise_timeline reads global_frame_counter before.
+            self.global_frame_counter = 0
+            self.cache_valid_len = 0
         text_len = getattr(self.args, "text_len", 256)
         max_chunk_latent_frames = max(ce - cs for _, cs, ce in chunk_schedule)
         max_img_tokens_per_chunk = max_chunk_latent_frames * tokens_per_frame
@@ -2051,6 +2107,12 @@ class CPTCausalInferencePipeline(BasePipeline):
             needs_guidance and not is_chunk_ar and single_slot_cfg_cache_enabled
         )
         persistent_cache_batch = batch_size if single_slot_cfg_cache else cfg_batch
+        if (needs_guidance and not single_slot_cfg_cache
+                and bool(getattr(self.args.inference, "kv_cache_host_staging", False))):
+            raise ValueError(
+                "kv_cache_host_staging with CFG requires rollout_type=seg_ar and "
+                "ar_single_slot_cfg_cache=true (one physical KV slot)"
+            )
         # Roll the cache forward with the conditional velocity only, the way
         # segment self-forcing training does. Without CFG the prediction already
         # is conditional, so there is nothing to separate.
@@ -2069,7 +2131,8 @@ class CPTCausalInferencePipeline(BasePipeline):
         def _prepare_persistent_kv_cache():
             # Deferred until text encoding is complete so the KV buffer never
             # shares the GPU with the text encoder (the pre-DiT peak otherwise
-            # includes both). Nothing between here and the DiT phase reads it.
+            # includes both). The counters this resets for a fresh rollout are
+            # already reset above (the noise timeline reads them earlier).
             if continuing_session:
                 expected_batch = int(self.kv_cache[0]["k"].shape[0])
                 if expected_batch != persistent_cache_batch:
@@ -2122,12 +2185,6 @@ class CPTCausalInferencePipeline(BasePipeline):
                     "Prepared phase-swapped GPU KV working set: "
                     f"capacity={self.kv_cache.active_capacity}, "
                     f"restored={restored_bytes / (1024**3):.2f} GiB"
-                )
-            if needs_guidance and not single_slot_cfg_cache and isinstance(
-                self.kv_cache, HostStagedKVCache
-            ):
-                raise ValueError(
-                    "kv_cache_host_staging with CFG requires ar_single_slot_cfg_cache=true"
                 )
 
         if single_slot_cfg_cache:
@@ -2223,64 +2280,61 @@ class CPTCausalInferencePipeline(BasePipeline):
         intra_seg_txt_offsets_per_seg: List[Optional[List[int]]] = []
         intra_seg_vid_windows_per_seg: List[Optional[List[List[int]]]] = []
 
-        # One text-encoder residency phase for every prompt of the request.
-        text_encode_phase = self._text_encode_phase()
-        text_encode_phase.__enter__()
-        for i, prompt in enumerate(prompts):
-            enc = self._encode_prompt(
-                prompt,
-                negative_prompt=negative_prompt,
-                encode_negative=needs_guidance,
-            )
-            encoded_prompts.append(enc)
-            a_start = (
-                self._compute_action_start(prompt)
-                if cross_segment_text_head_only
-                else -1
-            )
-            action_starts.append(a_start)
+        # One text-encoder residency phase for every prompt of the request;
+        # the with-block also releases it if encoding raises.
+        with self._text_encode_phase():
+            for i, prompt in enumerate(prompts):
+                enc = self._encode_prompt(
+                    prompt,
+                    negative_prompt=negative_prompt,
+                    encode_negative=needs_guidance,
+                )
+                encoded_prompts.append(enc)
+                a_start = (
+                    self._compute_action_start(prompt)
+                    if cross_segment_text_head_only
+                    else -1
+                )
+                action_starts.append(a_start)
 
-            offs = None
-            windows = None
-            if intra_seg_active:
-                try:
-                    offs = self._compute_action_text_offsets(prompt)
-                    if offs is not None:
-                        windows = self._compute_action_video_windows(
-                            prompt,
-                            seg_latent_start=latent_boundaries[i],
-                            seg_latent_end=latent_boundaries[i + 1],
+                offs = None
+                windows = None
+                if intra_seg_active:
+                    try:
+                        offs = self._compute_action_text_offsets(prompt)
+                        if offs is not None:
+                            windows = self._compute_action_video_windows(
+                                prompt,
+                                seg_latent_start=latent_boundaries[i],
+                                seg_latent_end=latent_boundaries[i + 1],
+                            )
+                            if windows is None:
+                                offs = None  # no per-action video footprint -> legacy
+                    except ValueError as _e:
+                        logger.warning(
+                            f"  [{i}] intra-seg masking disabled for this segment: {_e}"
                         )
-                        if windows is None:
-                            offs = None  # no per-action video footprint -> legacy
-                except ValueError as _e:
-                    logger.warning(
-                        f"  [{i}] intra-seg masking disabled for this segment: {_e}"
-                    )
-                    offs, windows = None, None
-            intra_seg_txt_offsets_per_seg.append(offs)
-            intra_seg_vid_windows_per_seg.append(windows)
-            logger.info(
-                f"  [{i}] Encoded (cross_segment_head_only="
-                f"{cross_segment_text_head_only}, action_start={a_start}, "
-                f"intra_seg={'on' if offs is not None else 'off'}): {prompt[:80]}..."
-            )
-        reference_enc = None
-        if reference_frames:
-            if swa_enabled:
-                raise ValueError("reference_image seeding does not support inference.sliding_window")
-            fps_value = float(getattr(self.args.inference, "video_fps", None) or getattr(self.args, "video_fps", 24))
-            reference_seconds = reference_frames * int(self.t_ratio or 4) / fps_value
-            reference_prompt_text = self._default_reference_prompt(
-                prompts[0], reference_seconds, caption=reference_prompt,
-            )
-            # Conditional branch only: the reference is written once into the
-            # canonical history, never evaluated under guidance.
-            reference_enc = self._encode_prompt(
-                reference_prompt_text, negative_prompt=negative_prompt, encode_negative=False,
-            )
-            logger.info(f"  [ref] Encoded reference prompt: {reference_prompt_text[:120]}...")
-        text_encode_phase.__exit__(None, None, None)
+                        offs, windows = None, None
+                intra_seg_txt_offsets_per_seg.append(offs)
+                intra_seg_vid_windows_per_seg.append(windows)
+                logger.info(
+                    f"  [{i}] Encoded (cross_segment_head_only="
+                    f"{cross_segment_text_head_only}, action_start={a_start}, "
+                    f"intra_seg={'on' if offs is not None else 'off'}): {prompt[:80]}..."
+                )
+            reference_enc = None
+            if reference_frames:
+                fps_value = float(getattr(self.args.inference, "video_fps", None) or getattr(self.args, "video_fps", 24))
+                reference_seconds = reference_frames * int(self.t_ratio or 4) / fps_value
+                reference_prompt_text = self._default_reference_prompt(
+                    prompts[0], reference_seconds, caption=reference_prompt,
+                )
+                # Conditional branch only: the reference is written once into the
+                # canonical history, never evaluated under guidance.
+                reference_enc = self._encode_prompt(
+                    reference_prompt_text, negative_prompt=negative_prompt, encode_negative=False,
+                )
+                logger.info(f"  [ref] Encoded reference prompt: {reference_prompt_text[:120]}...")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -2852,9 +2906,8 @@ class CPTCausalInferencePipeline(BasePipeline):
                                 cache["swa_segment_index"] = global_seg_idx
                                 cache["swa_action_start"] = action_starts[seg_idx]
 
-                        cache_write_extra_tokens = (
-                            int(chunk_latent_frames) * int(tokens_per_frame)
-                            + int(cache_write_text_states.shape[1])
+                        cache_write_extra_tokens = int(chunk_latent_frames) * int(tokens_per_frame) + (
+                            int(cache_write_text_states.shape[1]) if is_first_chunk_of_seg else 0
                         )
                         with torch.autocast(device_type="cuda", dtype=self.target_dtype), \
                                 self._kv_forward(update=True, extra_tokens=cache_write_extra_tokens):
@@ -3564,6 +3617,11 @@ class CPTCausalInferencePipeline(BasePipeline):
 
             generation_end = time.time()
 
+        if isinstance(self.kv_cache, HostStagedKVCache):
+            # The DiT phase is over; decode must not share the GPU with the
+            # KV staging ring (segment VAE decode is rejected with host staging).
+            self.kv_cache.release_staging()
+
         logger.info(f"\n{'=' * 60}")
         logger.info(f"PROFILING SUMMARY")
         logger.info(f"{'=' * 60}")
@@ -3600,11 +3658,18 @@ class CPTCausalInferencePipeline(BasePipeline):
         else:
             from hymm.models.dit.modules.kv_cache_storage import cache_geometry, cache_storage_audit
             storage_audits = [cache_storage_audit(cache) for cache in self.kv_cache]
+            host_staged = isinstance(self.kv_cache, HostStagedKVCache)
             self._last_kv_optimization_audit = {
                 "int8_kv": self.int8_kv_storage, "swa": swa_enabled,
                 "qvg_kv": getattr(self, "qvg_kv_storage", False),
                 "kv_storage_format": storage_audits[0]["storage_format"],
-                "gpu_kv_storage_bytes": sum(row["gpu_storage_bytes"] for row in storage_audits),
+                # Host-staged history lives on the host; the GPU only ever held
+                # the staging ring (its peak), not one buffer per layer.
+                "gpu_kv_storage_bytes": (
+                    self.kv_cache.peak_staging_bytes if host_staged
+                    else sum(row["gpu_storage_bytes"] for row in storage_audits)
+                ),
+                "host_kv_storage_bytes": self.kv_cache.host_bytes() if host_staged else 0,
                 "codec_stats": [row["codec_stats"] for row in storage_audits],
                 "kv_storage_layers": storage_audits,
                 "gpu_kv_peak_working_bytes_upper_bound": sum(row["peak_working_bytes"] for row in storage_audits),

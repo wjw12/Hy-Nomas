@@ -9,26 +9,31 @@ streaming code paths do not implement.
 """
 
 
+def _int_option(section, name: str, default: int) -> int:
+    """Read an integer option; only a missing / null value takes the default.
+
+    ``0`` must stay ``0`` so the ``>= 2`` slot guard can reject it.
+    """
+    value = getattr(section, name, None)
+    return default if value is None else int(value)
+
+
 def streaming_options(args) -> dict:
     parallelism = getattr(args, "parallelism", None)
     vae = getattr(args, "vae", None)
     inference = getattr(args, "inference", None)
     return {
         "dit_block_streaming": bool(getattr(parallelism, "dit_block_streaming", False)),
-        "dit_streaming_slots": int(getattr(parallelism, "dit_streaming_slots", 2) or 2),
-        "dit_resident_blocks": int(getattr(parallelism, "dit_resident_blocks", 0) or 0),
+        "dit_streaming_slots": _int_option(parallelism, "dit_streaming_slots", 2),
+        "dit_resident_blocks": _int_option(parallelism, "dit_resident_blocks", 0),
         "text_encoder_layer_streaming": bool(
             getattr(parallelism, "text_encoder_layer_streaming", False)
         ),
-        "text_encoder_streaming_slots": int(
-            getattr(parallelism, "text_encoder_streaming_slots", 2) or 2
-        ),
+        "text_encoder_streaming_slots": _int_option(parallelism, "text_encoder_streaming_slots", 2),
         "vae_layer_streaming": bool(getattr(vae, "layer_streaming", False)),
-        "vae_streaming_slots": int(getattr(vae, "streaming_slots", 2) or 2),
+        "vae_streaming_slots": _int_option(vae, "streaming_slots", 2),
         "kv_cache_host_staging": bool(getattr(inference, "kv_cache_host_staging", False)),
-        "kv_cache_host_staging_slots": int(
-            getattr(inference, "kv_cache_host_staging_slots", 2) or 2
-        ),
+        "kv_cache_host_staging_slots": _int_option(inference, "kv_cache_host_staging_slots", 2),
     }
 
 
@@ -104,12 +109,20 @@ def validate_streaming_config(args) -> None:
                 "kv_cache_host_staging keeps the full lifelong history; disable "
                 "inference.sliding_window (or use the sliding window without host staging)"
             )
-        for name in ("interactive_kv_cache_layerwise_cpu_offload", "preserve_kv_cache",
-                     "seg_ar_segment_vae_decode"):
+        # preserve_kv_cache is a per-call pipeline argument (interactive
+        # sessions), not a config key; the pipeline rejects it at entry.
+        for name in ("interactive_kv_cache_layerwise_cpu_offload", "seg_ar_segment_vae_decode"):
             if getattr(inference, name, False):
                 raise ValueError(f"kv_cache_host_staging does not support inference.{name}")
         if (float(getattr(inference, "cfg_scale_video", 1.0)) != 1.0
                 or float(getattr(inference, "camera_cfg_scale", 1.0)) != 1.0):
+            # Host staging holds one physical KV slot; chunk_ar CFG and seg_ar
+            # without the single-slot optimization keep one slot per branch.
+            if getattr(inference, "rollout_type", "seg_ar") == "chunk_ar":
+                raise ValueError(
+                    "kv_cache_host_staging with CFG requires rollout_type=seg_ar "
+                    "(chunk_ar keeps one KV slot per guidance branch)"
+                )
             if not bool(getattr(inference, "ar_single_slot_cfg_cache", True)):
                 raise ValueError(
                     "kv_cache_host_staging with CFG requires ar_single_slot_cfg_cache=true"
