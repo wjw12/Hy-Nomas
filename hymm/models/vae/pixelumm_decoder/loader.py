@@ -83,8 +83,10 @@ def maybe_load_pixelumm_decoder(args, *, device, logger):
         num_steps=int(_get(config, "num_steps", 1)),
         seed=int(_get(config, "seed", 42)),
         tail_hold_latents=int(_get(config, "tail_hold_latents", 1)),
-        # CPU offload also keeps the final decoded video off the GPU.
-        decode_output_cpu=_get(config, "cpu_offload", False),
+        # CPU offload (whole-model or per-layer streaming) also keeps the final
+        # decoded video off the GPU.
+        decode_output_cpu=bool(_get(config, "cpu_offload", False))
+        or bool(_get(config, "layer_streaming", False)),
         temporal_window_latents=int(_get(config, "temporal_window_latents", 10)),
         temporal_overlap_latents=int(_get(config, "temporal_overlap_latents", 5)),
         decoder_tile_pixels=int(_get(config, "tile_pixels", 0)),

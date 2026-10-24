@@ -144,6 +144,11 @@ model:
     vae_tiling: false
     vae_encode_tile_size: -1
     cpu_offload: false
+    # PixelUMM only: stream the 36 decoder layers from pinned host memory
+    # through GPU slot buffers during decode. Replaces cpu_offload; requires
+    # compile_decoder=false, no FP8 backend and parallel_mode=none.
+    layer_streaming: false
+    streaming_slots: 2
     stable_prefix_streaming: false
   text_encoder:
     name: qwen-2.5vl-7b
@@ -339,6 +344,16 @@ parallelism:
   # NOTE: dit_cpu_offload and dit_cpu_offload_for_decode cannot be both true at the same time.
   dit_cpu_offload: false
   dit_cpu_offload_for_decode: false
+  # ---- BF16 layer streaming (small-GPU path, output-identical) ----
+  # Keep the DiT in pinned host memory and stream one (double block, camera
+  # ActionModule) unit at a time through a ring of GPU slot buffers; unit i+1
+  # is copied on a side stream while unit i computes. Replaces dit_cpu_offload.
+  dit_block_streaming: false
+  dit_streaming_slots: 2        # >= 2; slots-1 units are prefetched ahead
+  dit_resident_blocks: 0        # keep the first N blocks on the GPU per phase (spare VRAM)
+  # Same scheme for the Qwen2.5-VL decoder layers. Replaces text_encoder_cpu_offload.
+  text_encoder_layer_streaming: false
+  text_encoder_streaming_slots: 2
 
 # ======================== Evaluation / Inference ========================
 inference:
@@ -351,6 +366,11 @@ inference:
   lora_adapter: null
   dit_weight_quantization: none  # int8 requires a validated W8 checkpoint
   kv_cache_quantization: none   # none | int8 | qvg; compressed storage uses BF16 attention
+  # Exact BF16 lifelong KV history in pinned host memory, staged per layer into
+  # a small GPU ring as the block loop reaches each layer (small-GPU path).
+  # Requires kv_cache_quantization=none, sliding_window disabled, seg_ar/chunk_ar.
+  kv_cache_host_staging: false
+  kv_cache_host_staging_slots: 2
   qvg_kv_cache:
     preset: upstream_default   # quant-videogen==0.1.0 real Triton PRQ codec
     text_storage: int8         # int8 | bf16; QVG only compresses video KV

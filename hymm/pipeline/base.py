@@ -18,6 +18,8 @@ from hymm.distributed.fsdp_util import apply_fsdp2_text_encoder
 from hymm.utils.model_cpu_offload import (
     install_model_cpu_offload, offload_dit_for_decode, validate_model_cpu_offload,
 )
+from hymm.utils.module_streaming import install_module_streaming
+from hymm.utils.streaming_config import streaming_options, validate_streaming_config
 
 
 def align_to(value, alignment):
@@ -39,6 +41,8 @@ class BasePipeline(nn.Module):
         self.device = device
         self.world_mesh = world_mesh
         validate_model_cpu_offload(args, device)
+        validate_streaming_config(args)
+        self.streaming = streaming_options(args)
         from hymm.utils.range_attention_config import validate_range_attention_device
         validate_range_attention_device(args, device)
         self.enable_parallel_vae_decode = (
@@ -86,7 +90,8 @@ class BasePipeline(nn.Module):
         )
 
         dit_offload = bool(getattr(args.parallelism, "dit_cpu_offload", False))
-        dit_device = torch.device("cpu") if dit_offload else device
+        dit_streaming = bool(self.streaming["dit_block_streaming"])
+        dit_device = torch.device("cpu") if (dit_offload or dit_streaming) else device
         quantized = resolve_w8_bf16_checkpoint(args.inference, dit_model_path)
         lora_adapter = getattr(args.inference, "lora_adapter", None)
         if quantized:
@@ -115,6 +120,9 @@ class BasePipeline(nn.Module):
                 ),
                 args=args,
                 logger=logger,
+                # CPU-resident paths: cast FP32 files to BF16 while reading so
+                # host RAM peaks at one BF16 copy instead of FP32 dict + model.
+                cast_to_model_dtype=dit_device.type == "cpu",
             )
             if lora_adapter:
                 from hymm.models.lora import load_lora_adapter
@@ -144,30 +152,38 @@ class BasePipeline(nn.Module):
 
         if dit_offload:
             install_model_cpu_offload(self.transformer, device, stage_prefix="dit")
+        elif dit_streaming:
+            self._install_dit_block_streaming()
 
         te_offload = getattr(args.parallelism, "text_encoder_cpu_offload", False)
+        te_streaming = bool(self.streaming["text_encoder_layer_streaming"])
         self.text_encoder = load_text_encoder(
-            device=torch.device("cpu") if te_offload else device,
+            device=torch.device("cpu") if (te_offload or te_streaming) else device,
             logger=logger,
             args=args,
         )
         self.text_encoder.eval().requires_grad_(False)
         if te_offload and args.parallelism.sp_size == 1:
             install_model_cpu_offload(self.text_encoder, device)
-        self._maybe_shard_text_encoder()
+        elif te_streaming:
+            self._install_text_encoder_layer_streaming()
+        else:
+            self._maybe_shard_text_encoder()
 
         from hymm.models.vae.pixelumm_decoder import (
             maybe_load_pixelumm_decoder,
         )
 
         pixelumm_offload = getattr(args.vae, "cpu_offload", False)
+        pixelumm_streaming = bool(self.streaming["vae_layer_streaming"])
         # Serialized FP8 buffers can load directly on CPU for offload.
         # Only legacy BF16-to-FP8 conversion needs CUDA initialization.
         from hymm.models.vae.pixelumm_decoder.prequantized import is_prequantized_pixelumm
         fp8_enabled = (getattr(args.vae, "cutlass_fp8", False)
                        or getattr(args.vae, "deepgemm_fp8", False))
-        pixelumm_load_on_cpu = pixelumm_offload and (
-            not fp8_enabled or is_prequantized_pixelumm(args.vae.checkpoint)
+        pixelumm_load_on_cpu = pixelumm_streaming or (
+            pixelumm_offload
+            and (not fp8_enabled or is_prequantized_pixelumm(args.vae.checkpoint))
         )
         pixelumm_decoder = maybe_load_pixelumm_decoder(
             args,
@@ -190,6 +206,10 @@ class BasePipeline(nn.Module):
         self.vae.eval().requires_grad_(False)
         if pixelumm_offload:
             install_model_cpu_offload(self.vae, device)
+        elif pixelumm_streaming:
+            if pixelumm_decoder is None:
+                raise ValueError("model.vae.layer_streaming requires the PixelUMM decoder")
+            self._install_pixelumm_layer_streaming()
 
         self.scheduler = EulerSolver(
             shift=args.inference.infer_flow_shift_video,
@@ -197,14 +217,120 @@ class BasePipeline(nn.Module):
             solver="euler",
         )
 
+    # ------------------------------------------------------------------
+    # BF16 layer streaming (small-GPU path; output-identical to resident)
+    # ------------------------------------------------------------------
+    def _install_dit_block_streaming(self):
+        """Stream (double block, ActionModule) pairs; keep embedders/final layer resident."""
+        transformer = self.transformer
+        blocks = list(transformer.double_blocks)
+        actions = list(getattr(transformer, "action_modules", []) or [])
+        units = []
+        for index, block in enumerate(blocks):
+            group = [block]
+            if index < len(actions):
+                group.append(actions[index])
+            units.append(group)
+        streamer = install_module_streaming(
+            transformer,
+            units,
+            device=self.device,
+            slots=self.streaming["dit_streaming_slots"],
+            resident_units=self.streaming["dit_resident_blocks"],
+            stage_prefix="dit",
+            name="dit",
+        )
+        logger.info(
+            "DiT block streaming: "
+            f"{len(units)} units x {streamer.unit_bytes / 2**20:.0f} MiB, "
+            f"slots={streamer.slots}, resident_blocks={streamer.resident_units}, "
+            f"resident_other={(streamer.resident_packed.nbytes if streamer.resident_packed else 0) / 2**20:.0f} MiB, "
+            f"pinned={streamer.pinned}, pack_seconds={streamer.pack_seconds:.1f}"
+        )
+
+    def _install_text_encoder_layer_streaming(self):
+        from hymm.distributed.fsdp_util import _find_decoder_layers
+
+        hf_model = getattr(self.text_encoder, "model", self.text_encoder)
+        layers, _parent = _find_decoder_layers(hf_model)
+        if layers is None:
+            raise ValueError("text_encoder_layer_streaming could not locate the decoder layers")
+        units = [[layer] for layer in layers]
+        streamer = install_module_streaming(
+            hf_model,
+            units,
+            device=self.device,
+            slots=self.streaming["text_encoder_streaming_slots"],
+            stage_prefix="te",
+            name="text_encoder",
+        )
+        # The TextEncoder wrapper's @cpu_offloaded encode() reads the controller
+        # from the wrapper, not from the HF module.
+        self.text_encoder._model_cpu_offload = streamer
+        self.text_encoder._module_streamer = streamer
+        logger.info(
+            "Text encoder layer streaming: "
+            f"{len(units)} layers x {streamer.unit_bytes / 2**20:.0f} MiB, "
+            f"slots={streamer.slots}, "
+            f"resident={(streamer.resident_packed.nbytes if streamer.resident_packed else 0) / 2**20:.0f} MiB, "
+            f"pinned={streamer.pinned}"
+        )
+
+    def _install_pixelumm_layer_streaming(self):
+        decoder = getattr(self.vae, "decoder", None)
+        layers = getattr(decoder, "layers", None)
+        if layers is None:
+            raise ValueError("model.vae.layer_streaming requires a PixelUMM decoder with .layers")
+        units = [[layer] for layer in layers]
+        streamer = install_module_streaming(
+            self.vae,
+            units,
+            device=self.device,
+            slots=self.streaming["vae_streaming_slots"],
+            stage_prefix="pixelumm",
+            name="pixelumm",
+        )
+        logger.info(
+            "PixelUMM layer streaming: "
+            f"{len(units)} layers x {streamer.unit_bytes / 2**20:.0f} MiB, "
+            f"slots={streamer.slots}, "
+            f"resident={(streamer.resident_packed.nbytes if streamer.resident_packed else 0) / 2**20:.0f} MiB, "
+            f"pinned={streamer.pinned}"
+        )
+
+    @contextmanager
+    def _text_encode_phase(self):
+        """One residency phase for every prompt of a request.
+
+        Whole-model offload and layer streaming both nest, so the encoder is
+        moved (or its slots allocated) once per request instead of per prompt.
+        """
+        controller = getattr(self.text_encoder, "_model_cpu_offload", None)
+        if controller is None or not hasattr(controller, "on_device"):
+            yield
+            return
+        self.text_encoder._last_inference_mode = torch.is_inference_mode_enabled()
+        with controller.on_device():
+            yield
+
     @contextmanager
     def _dit_denoise_residency(self):
         """Keep DiT on this rank's GPU for a whole denoising/cache-write phase.
 
         Text encoding and VAE/output processing stay outside this scope. No
         per-forward hook is installed, so all denoise steps share one transfer.
+        With block streaming the scope instead allocates the slot ring once and
+        streams blocks through it for every forward inside.
         """
         parallelism = getattr(self.args, "parallelism", None)
+        if self.streaming["dit_block_streaming"]:
+            streamer = getattr(self.transformer, "_module_streamer", None)
+            if streamer is None:
+                raise RuntimeError("dit_block_streaming requires an installed block streamer")
+            self.transformer._last_inference_mode = torch.is_inference_mode_enabled()
+            with streamer.on_device():
+                yield
+            return
         if not getattr(parallelism, "dit_cpu_offload", False):
             yield
             return

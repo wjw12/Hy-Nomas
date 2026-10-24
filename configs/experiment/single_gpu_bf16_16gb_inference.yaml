@@ -1,0 +1,70 @@
+# @package _global_
+# Single-GPU BF16 preset for cards with about 16 GB (and 12 GB) of memory.
+#
+# No quantization, no compression, no sliding window: the full BF16 DiT,
+# PixelUMM decoder and Qwen2.5-VL text encoder run with output identical to the
+# multi-GPU preset. Memory comes from scheduling only:
+#   * each model is streamed layer by layer from pinned host memory through a
+#     ring of GPU slot buffers (unit i+1 copies while unit i computes);
+#   * the lifelong KV history lives in pinned host memory and is staged per
+#     layer into GPU double buffers;
+#   * phases stay mutually exclusive (text encode -> DiT -> decode).
+# Host RAM is the new ceiling: ~17 GB (DiT) + ~14 GB (text encoder) + ~14 GB
+# (decoder) of pinned weights, plus ~389 MB of KV per generated latent frame
+# at 720x1280 (~2.3 GB per second of video). 64 GB host RAM is the practical
+# minimum for short clips; 96 to 128 GB for longer rollouts.
+defaults:
+  - /experiment/inference
+  - _self_
+
+name: single_gpu_bf16_16gb_inference
+
+dit_weight: /path/to/hy-nomas-distilled-bf16-or-fp32.safetensors
+
+model:
+  dit:
+    seg_ar_attention_backend: flex  # SM89 and below; 'magi' needs Hopper (SM90+)
+  vae:
+    checkpoint: /path/to/pixelumm.safetensors   # the BF16/FP32 PixelUMM_FT file, not the FP8 one
+    cutlass_fp8: false
+    deepgemm_fp8: false
+    compile_decoder: false
+    cpu_offload: false
+    layer_streaming: true
+    streaming_slots: 2
+    parallel_mode: none
+
+parallelism:
+  sp_size: 1
+  shard_text_encoder: false
+  text_encoder_cpu_offload: false
+  text_encoder_layer_streaming: true
+  text_encoder_streaming_slots: 2
+  dit_cpu_offload: false
+  dit_cpu_offload_for_decode: false
+  dit_block_streaming: true
+  dit_streaming_slots: 2
+  # Spend spare VRAM on resident blocks once the first profiled run shows
+  # headroom (each block is ~311 MB). 0 is the safe starting point.
+  dit_resident_blocks: 0
+
+inference:
+  dit_weight_quantization: none
+  kv_cache_quantization: none
+  kv_cache_host_staging: true
+  kv_cache_host_staging_slots: 2
+  sliding_window:
+    enabled: false
+  sparse_attention:
+    enabled: false
+  seg_ar_segment_vae_decode: false
+
+  # Compiled pre/post-attention lowers activation peaks and is compatible with
+  # streaming (weights are passed as arguments, CUDA graphs are off). If the
+  # first run logs recompilations every block, set this to false.
+  torch_compile: true
+  inference_mode: true
+  # Record allocated/reserved/peak memory at every stage boundary into
+  # <video>.stages.rank0.jsonl and <video>.performance.json.
+  profile_memory: true
+  output_chunk_frames: 8

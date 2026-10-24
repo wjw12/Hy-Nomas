@@ -217,7 +217,10 @@ def cpu_offload_snapshot(pipeline):
             # Do not retain the final tensor while the next model changes residency.
             tensor = None
         controller = getattr(module, "_model_cpu_offload", None)
-        if controller is not None:
+        if controller is not None and hasattr(controller, "snapshot"):
+            # Layer streaming (hymm.utils.module_streaming.ModuleStreamer).
+            row.update(controller.snapshot())
+        elif controller is not None:
             row.update(
                 policy="denoise_phase" if name == "dit" else "whole_model",
                 completed_calls=controller.completed_calls,

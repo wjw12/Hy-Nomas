@@ -1,5 +1,6 @@
 """Segment / chunk-level KV-cache autoregressive inference pipeline (seg_ar / chunk_ar)."""
 
+from contextlib import contextmanager
 import math
 import os
 import time
@@ -22,6 +23,7 @@ from hymm.distributed.parallel_states import (
     nccl_info,
 )
 from hymm.utils.parallel import sync_random_states
+from hymm.models.dit.modules.host_staged_kv_cache import HostStagedKVCache
 from hymm.models.dit.modules.uniform_history_cache import (
     ARCHIVED_HISTORY_SAMPLINGS, HISTORY_SAMPLINGS, validate_swa_streaming_rollback,
 )
@@ -536,6 +538,7 @@ class CPTCausalInferencePipeline(BasePipeline):
                 False,
             )
         )
+        host_staging = bool(getattr(self.args.inference, "kv_cache_host_staging", False))
         cpu_mode = (
             str(
                 getattr(
@@ -552,7 +555,33 @@ class CPTCausalInferencePipeline(BasePipeline):
                 "interactive CPU KV offload supports only explicit "
                 "inference.interactive_kv_cache_cpu_mode=phase_swap"
             )
-        if cpu_offload:
+        if host_staging:
+            if cpu_offload or self.int8_kv_storage or qvg_storage:
+                raise ValueError(
+                    "kv_cache_host_staging keeps exact BF16 history and cannot be "
+                    "combined with phase-swap offload or compressed KV"
+                )
+            # Exact BF16 history in pinned host memory; each layer is staged into
+            # a small GPU ring as the block loop reaches it (small-GPU path).
+            self.kv_cache = HostStagedKVCache(
+                num_blocks=self.num_double_blocks,
+                batch_size=batch_size,
+                max_cache_tokens=max_cache_tokens,
+                cache_heads=cache_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                device=device,
+                slots=int(getattr(self.args.inference, "kv_cache_host_staging_slots", 2) or 2),
+            )
+            self.cache_mask_list = [
+                torch.zeros(
+                    [batch_size, max_cache_tokens],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                for _ in range(self.num_double_blocks)
+            ]
+        elif cpu_offload:
             if self.int8_kv_storage or qvg_storage:
                 raise ValueError("Compressed KV cannot use PhaseSwappedKVCache")
             reusable = (
@@ -625,14 +654,51 @@ class CPTCausalInferencePipeline(BasePipeline):
             f"KV cache initialized: {self.num_double_blocks} blocks, "
             f"max_tokens={max_cache_tokens}, heads={cache_heads}, "
             f"format={'qvg' if qvg_storage else 'int8' if self.int8_kv_storage else 'none'}, "
-            f"storage={'cpu-phase_swap' if cpu_offload else 'gpu'}, "
+            f"storage={'cpu-host_staged' if host_staging else 'cpu-phase_swap' if cpu_offload else 'gpu'}, "
             f"pinned={getattr(self.kv_cache, 'pin_memory_enabled', False)}"
         )
+        if host_staging:
+            logger.info(
+                "  host-staged KV: "
+                f"host={self.kv_cache.host_bytes() / 2**30:.2f} GiB pinned "
+                f"({self.kv_cache.slots} GPU staging slots sized per forward)"
+            )
+
+    @contextmanager
+    def _kv_forward(self, *, update: bool, extra_tokens: int = 0):
+        """Bracket one DiT forward for a host-staged KV cache (no-op otherwise)."""
+        cache = self.kv_cache
+        if not isinstance(cache, HostStagedKVCache):
+            yield
+            return
+        cache.begin_forward(
+            valid_len=self.cache_valid_len, extra_tokens=int(extra_tokens), update=update,
+        )
+        try:
+            yield
+        finally:
+            cache.end_forward()
 
     def _ensure_kv_cache_capacity(self, required_tokens: int) -> None:
         """Grow persistent history storage, excluding SWA's current-segment KV."""
         if self.kv_cache is None or self.cache_mask_list is None:
             raise RuntimeError("KV cache must be initialized before it can grow")
+        if isinstance(self.kv_cache, HostStagedKVCache):
+            if self.kv_cache.capacity < required_tokens:
+                old_capacity = self.kv_cache.capacity
+                self.kv_cache.grow(required_tokens, self.cache_valid_len)
+                for index, old in enumerate(self.cache_mask_list):
+                    grown = torch.zeros(
+                        [old.shape[0], required_tokens], dtype=old.dtype, device=old.device,
+                    )
+                    grown[:, : self.cache_valid_len].copy_(old[:, : self.cache_valid_len])
+                    PhaseSwappedKVCache._copy_mask_metadata(old, grown)
+                    self.cache_mask_list[index] = grown
+                logger.info(
+                    "Persistent host-staged KV backing grown: "
+                    f"{old_capacity} -> {self.kv_cache.capacity} tokens"
+                )
+            return
         if isinstance(self.kv_cache, PhaseSwappedKVCache):
             if self.kv_cache.capacity < required_tokens:
                 old_capacity = self.kv_cache.capacity
@@ -1064,7 +1130,13 @@ class CPTCausalInferencePipeline(BasePipeline):
         tokens_to_evict = self.segment_token_lengths.pop(0)
         remaining = self.cache_valid_len - tokens_to_evict
 
-        if remaining > 0:
+        if remaining > 0 and isinstance(self.kv_cache, HostStagedKVCache):
+            self.kv_cache.evict_front(tokens_to_evict, self.cache_valid_len)
+            for mask in self.cache_mask_list:
+                mask[:, :remaining] = mask[
+                    :, tokens_to_evict : self.cache_valid_len
+                ].clone()
+        elif remaining > 0:
             for cache in self.kv_cache:
                 keys = (
                     ("k", "v", "k_scale", "v_scale")
@@ -1887,57 +1959,70 @@ class CPTCausalInferencePipeline(BasePipeline):
             f"cache_valid_len={self.cache_valid_len}, "
             f"global_frame_counter={self.global_frame_counter}"
         )
-        if continuing_session:
-            expected_batch = int(self.kv_cache[0]["k"].shape[0])
-            if expected_batch != persistent_cache_batch:
-                raise RuntimeError(
-                    "Interactive continuation changed CFG cache batch size: "
-                    f"existing={expected_batch}, requested={persistent_cache_batch}."
-                )
-            self._ensure_kv_cache_capacity(
-                swa_capacity if swa_enabled else self.cache_valid_len + request_cache_tokens
-            )
-            logger.info(
-                "Continuing persistent AR session: "
-                f"cached_segments={session_segment_offset}, "
-                f"cache_tokens={self.cache_valid_len}, "
-                f"global_frames={self.global_frame_counter}"
-            )
-        else:
-            self._initialize_kv_cache(
-                batch_size=persistent_cache_batch,
-                max_cache_tokens=max_cache_tokens,
-                dtype=self.target_dtype,
-                device=self.device,
-            )
-            self._interactive_cached_action_tails = []
-            self._interactive_cached_seg_video_ranges = []
-            self._interactive_segment_count = 0
-            self._interactive_segment_cache_tokens = []
-            self._interactive_segment_latent_lengths = []
-            if not preserve_kv_cache:
-                self._reset_interactive_noise_state()
-        if swa_enabled:
-            for cache in self.kv_cache:
-                cache["swa_capacity"] = swa_capacity
-                if swa_archived:
-                    cache["swa_sampling"] = swa_sampling
-                    cache["swa_past_frames"] = past_frames
-                    cache["swa_gamma"] = swa_gamma
-        if isinstance(self.kv_cache, PhaseSwappedKVCache):
-            restored_bytes = self.kv_cache.restore(
-                required_tokens=(
+        def _prepare_persistent_kv_cache():
+            # Deferred until text encoding is complete so the KV buffer never
+            # shares the GPU with the text encoder (the pre-DiT peak otherwise
+            # includes both). Nothing between here and the DiT phase reads it.
+            if continuing_session:
+                expected_batch = int(self.kv_cache[0]["k"].shape[0])
+                if expected_batch != persistent_cache_batch:
+                    raise RuntimeError(
+                        "Interactive continuation changed CFG cache batch size: "
+                        f"existing={expected_batch}, requested={persistent_cache_batch}."
+                    )
+                self._ensure_kv_cache_capacity(
                     swa_capacity if swa_enabled else self.cache_valid_len + request_cache_tokens
-                ),
-                valid_tokens=self.cache_valid_len,
-            )
-            self.cache_mask_list = self.kv_cache.cache_masks
-            self._offload_interactive_pixelumm()
-            logger.info(
-                "Prepared phase-swapped GPU KV working set: "
-                f"capacity={self.kv_cache.active_capacity}, "
-                f"restored={restored_bytes / (1024**3):.2f} GiB"
-            )
+                )
+                logger.info(
+                    "Continuing persistent AR session: "
+                    f"cached_segments={session_segment_offset}, "
+                    f"cache_tokens={self.cache_valid_len}, "
+                    f"global_frames={self.global_frame_counter}"
+                )
+            else:
+                self._initialize_kv_cache(
+                    batch_size=persistent_cache_batch,
+                    max_cache_tokens=max_cache_tokens,
+                    dtype=self.target_dtype,
+                    device=self.device,
+                )
+                self._interactive_cached_action_tails = []
+                self._interactive_cached_seg_video_ranges = []
+                self._interactive_segment_count = 0
+                self._interactive_segment_cache_tokens = []
+                self._interactive_segment_latent_lengths = []
+                if not preserve_kv_cache:
+                    self._reset_interactive_noise_state()
+            if swa_enabled:
+                if isinstance(self.kv_cache, HostStagedKVCache):
+                    raise ValueError("kv_cache_host_staging keeps the full history; disable sliding_window")
+                for cache in self.kv_cache:
+                    cache["swa_capacity"] = swa_capacity
+                    if swa_archived:
+                        cache["swa_sampling"] = swa_sampling
+                        cache["swa_past_frames"] = past_frames
+                        cache["swa_gamma"] = swa_gamma
+            if isinstance(self.kv_cache, PhaseSwappedKVCache):
+                restored_bytes = self.kv_cache.restore(
+                    required_tokens=(
+                        swa_capacity if swa_enabled else self.cache_valid_len + request_cache_tokens
+                    ),
+                    valid_tokens=self.cache_valid_len,
+                )
+                self.cache_mask_list = self.kv_cache.cache_masks
+                self._offload_interactive_pixelumm()
+                logger.info(
+                    "Prepared phase-swapped GPU KV working set: "
+                    f"capacity={self.kv_cache.active_capacity}, "
+                    f"restored={restored_bytes / (1024**3):.2f} GiB"
+                )
+            if needs_guidance and not single_slot_cfg_cache and isinstance(
+                self.kv_cache, HostStagedKVCache
+            ):
+                raise ValueError(
+                    "kv_cache_host_staging with CFG requires ar_single_slot_cfg_cache=true"
+                )
+
         if single_slot_cfg_cache:
             logger.info(
                 "  seg_ar CFG cache optimization: one persistent canonical KV "
@@ -2031,6 +2116,9 @@ class CPTCausalInferencePipeline(BasePipeline):
         intra_seg_txt_offsets_per_seg: List[Optional[List[int]]] = []
         intra_seg_vid_windows_per_seg: List[Optional[List[List[int]]]] = []
 
+        # One text-encoder residency phase for every prompt of the request.
+        text_encode_phase = self._text_encode_phase()
+        text_encode_phase.__enter__()
         for i, prompt in enumerate(prompts):
             enc = self._encode_prompt(
                 prompt,
@@ -2070,6 +2158,13 @@ class CPTCausalInferencePipeline(BasePipeline):
                 f"{cross_segment_text_head_only}, action_start={a_start}, "
                 f"intra_seg={'on' if offs is not None else 'off'}): {prompt[:80]}..."
             )
+        text_encode_phase.__exit__(None, None, None)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Text encoder is off the GPU: allocate (or continue) the persistent KV
+        # history now, right before the DiT phase.
+        _prepare_persistent_kv_cache()
 
         # Cached text-block action-tail ranges, in absolute cache-token coords:
         #   list of (seg_idx, tail_start, tail_end).
@@ -2353,7 +2448,8 @@ class CPTCausalInferencePipeline(BasePipeline):
                             latent_input = latent_input.repeat(guidance_branches, 1, 1, 1, 1)
                             t_expand = t_expand.repeat(guidance_branches)
 
-                        with torch.autocast(device_type="cuda", dtype=self.target_dtype):
+                        with torch.autocast(device_type="cuda", dtype=self.target_dtype), \
+                                self._kv_forward(update=False):
                             output = self.transformer.forward_with_cache(
                                 hidden_states=latent_input,
                                 timestep=t_expand,
@@ -2604,7 +2700,12 @@ class CPTCausalInferencePipeline(BasePipeline):
                                 cache["swa_segment_index"] = global_seg_idx
                                 cache["swa_action_start"] = action_starts[seg_idx]
 
-                        with torch.autocast(device_type="cuda", dtype=self.target_dtype):
+                        cache_write_extra_tokens = (
+                            int(chunk_latent_frames) * int(tokens_per_frame)
+                            + int(cache_write_text_states.shape[1])
+                        )
+                        with torch.autocast(device_type="cuda", dtype=self.target_dtype), \
+                                self._kv_forward(update=True, extra_tokens=cache_write_extra_tokens):
                             _, new_tokens = self.transformer.forward_with_cache(
                                 hidden_states=cache_input,
                                 timestep=cache_t,
@@ -3375,7 +3476,14 @@ class CPTCausalInferencePipeline(BasePipeline):
                 "history_layout": list(self.kv_cache[0].get("swa_uniform_layout", ())) if swa_archived else [],
                 "history_updates": len(self.kv_cache[0].get("swa_archive", ())) if swa_archived else 0,
                 "cpu_archive_bytes": sum(cache.get("swa_archive_bytes", 0) for cache in self.kv_cache),
-                "capacity": swa_capacity if swa_enabled else int(cache_geometry(self.kv_cache[0])[0][1]),
+                "host_staged_kv": (
+                    self.kv_cache.snapshot() if isinstance(self.kv_cache, HostStagedKVCache) else None
+                ),
+                "capacity": (
+                    swa_capacity if swa_enabled
+                    else self.kv_cache.capacity if isinstance(self.kv_cache, HostStagedKVCache)
+                    else int(cache_geometry(self.kv_cache[0])[0][1])
+                ),
                 "valid_tokens": self.cache_valid_len, "tokens_per_frame": tokens_per_frame,
                 "block_count": len(self.kv_cache),
                 "sparse": bool(getattr(self.transformer, "nomas_sparse_config", {}).get("enabled", False)),

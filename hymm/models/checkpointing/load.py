@@ -31,11 +31,14 @@ def load_hunyuan_state_dict(
     convert_state_dict_in_out=False,
     convert_state_dict_16168_to_16164=False,
     logger=None,
+    cast_to_model_dtype=False,
 ):
     """Load a compatible safetensors checkpoint into the DiT.
 
     A base DiT may omit newly initialized camera modules. Other missing model
     parameters and tensor-shape mismatches indicate incompatible weights.
+    ``cast_to_model_dtype`` streams the file tensor by tensor and casts to the
+    model's parameter dtype on the way in, halving host RAM for FP32 files.
     """
     if convert_state_dict_in_out or convert_state_dict_16168_to_16164:
         raise ValueError(
@@ -43,23 +46,44 @@ def load_hunyuan_state_dict(
             "legacy weight-shape conversion is unsupported"
         )
     path = _weight_path(dit_weight)
-    weights = load_file(str(path))
-    if not weights:
-        raise ValueError(f"DiT checkpoint contains no tensors: {path}")
+    expected = model.state_dict()
 
-    remapped = {}
-    camera_pattern = re.compile(r"^double_blocks\.(\d+)\.action_module\.(.+)$")
-    for key, tensor in weights.items():
+    def _normalize(key):
         match = camera_pattern.match(key)
         if match:
             key = f"action_modules.{match.group(1)}.{match.group(2)}"
         key = key.replace("._checkpoint_wrapped_module.", ".")
-        key = key.replace("_checkpoint_wrapped_module.", "")
-        if key in remapped:
-            raise ValueError(f"Duplicate DiT key after normalization: {key}")
-        remapped[key] = tensor
+        return key.replace("_checkpoint_wrapped_module.", "")
 
-    expected = model.state_dict()
+    camera_pattern = re.compile(r"^double_blocks\.(\d+)\.action_module\.(.+)$")
+    remapped = {}
+    if cast_to_model_dtype:
+        # Read tensor by tensor and cast each floating tensor to the model's
+        # dtype as it arrives, so an FP32 checkpoint costs one BF16 copy of host
+        # RAM instead of the full FP32 dict plus the model (34 GB + 17 GB for
+        # the 8.5B DiT). The values are identical to casting after load.
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            for raw_key in handle.keys():
+                key = _normalize(raw_key)
+                if key in remapped:
+                    raise ValueError(f"Duplicate DiT key after normalization: {key}")
+                tensor = handle.get_tensor(raw_key)
+                target = expected.get(key)
+                if target is not None and tensor.is_floating_point() and tensor.dtype != target.dtype:
+                    tensor = tensor.to(dtype=target.dtype)
+                remapped[key] = tensor
+    else:
+        weights = load_file(str(path))
+        for raw_key, tensor in weights.items():
+            key = _normalize(raw_key)
+            if key in remapped:
+                raise ValueError(f"Duplicate DiT key after normalization: {key}")
+            remapped[key] = tensor
+    if not remapped:
+        raise ValueError(f"DiT checkpoint contains no tensors: {path}")
+
     unexpected = sorted(set(remapped) - set(expected))
     for key in unexpected:
         del remapped[key]
@@ -102,6 +126,7 @@ def load_transformer(
     convert_state_dict_16168_to_16164=False,
     args=None,
     logger=None,
+    cast_to_model_dtype=False,
 ):
     """Construct the public DiT and load safetensors weights."""
     transformer = load_model(model_type, args, factor_kwargs)
@@ -112,6 +137,7 @@ def load_transformer(
         convert_state_dict_in_out=convert_state_dict_in_out,
         convert_state_dict_16168_to_16164=convert_state_dict_16168_to_16164,
         logger=logger,
+        cast_to_model_dtype=cast_to_model_dtype,
     )
 
 
